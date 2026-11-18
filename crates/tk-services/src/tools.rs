@@ -215,7 +215,7 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
                 value: args["value"].as_str().unwrap_or("").to_string(),
                 kind: args["kind"].as_str().filter(|k| !k.is_empty()).map(String::from),
             };
-            let changed = facts::announce(&svc.db.lock().unwrap(), &target, &f, source, args["note"].as_str())?;
+            let changed = facts::announce(&mut svc.store.lock().unwrap(), &target, &f, source, args["note"].as_str())?;
             if changed {
                 svc.facts_changed(&target);
             }
@@ -224,7 +224,7 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
         "fact_clear" => {
             ensure_session(&target)?;
             let key = args["key"].as_str().ok_or("key missing")?;
-            let n = facts::clear(&svc.db.lock().unwrap(), &target, key, args["value"].as_str())?;
+            let n = facts::clear(&mut svc.store.lock().unwrap(), &target, key, args["value"].as_str())?;
             if n > 0 {
                 svc.facts_changed(&target);
             }
@@ -232,7 +232,7 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
         }
         "fact_list" => {
             ensure_session(&target)?;
-            let list = facts::current(&svc.db.lock().unwrap(), Some(&target), None).map_err(|e| e.to_string())?;
+            let list = facts::current(&svc.store.lock().unwrap(), Some(&target), None).map_err(|e| e.to_string())?;
             Ok(serde_json::to_value(list).unwrap())
         }
         "fact_query" => {
@@ -242,7 +242,7 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
                 .iter()
                 .map(|(k, v)| FactInput { key: k.clone(), value: v.as_str().unwrap_or("").to_string(), kind: None })
                 .collect();
-            let ids = facts::query(&svc.db.lock().unwrap(), &filter)?;
+            let ids = facts::query(&svc.store.lock().unwrap(), &filter)?;
             sessions_with_facts(svc, |id| ids.iter().any(|i| i == id), None)
         }
         "session_list" => sessions_with_facts(svc, |_| true, args["state"].as_str()),
@@ -265,7 +265,7 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
                 return Ok(json!({ "project": project, "decisions": list }));
             }
             let project = project.ok_or("no project: call from a session or pass project_dir")?;
-            let cur = facts::current(&svc.db.lock().unwrap(), Some(&target), None).map_err(|e| e.to_string())?;
+            let cur = facts::current(&svc.store.lock().unwrap(), Some(&target), None).map_err(|e| e.to_string())?;
             let s = |k: &str| args[k].as_str().filter(|v| !v.is_empty()).map(String::from);
             let d = crate::decisions::Decision {
                 title: args["title"].as_str().unwrap_or("").to_string(),
@@ -361,7 +361,7 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
 
 fn sessions_with_facts(svc: &Services, keep: impl Fn(&str) -> bool, state: Option<&str>) -> Result<Value, String> {
     let sessions = svc.sessions(state)?;
-    let all = facts::current(&svc.db.lock().unwrap(), None, None).map_err(|e| e.to_string())?;
+    let all = facts::current(&svc.store.lock().unwrap(), None, None).map_err(|e| e.to_string())?;
     Ok(Value::Array(
         sessions
             .into_iter()

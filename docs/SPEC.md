@@ -80,7 +80,7 @@ Three small helper executables sit next to the layers. They are never reloaded i
 | Layer                | Process       | Owns                                                                                          | Reloaded by          | Expected change rate |
 |----------------------|---------------|-----------------------------------------------------------------------------------------------|----------------------|----------------------|
 | **L1 Core**          | `tk-core`     | Message bus, layer supervisor, build + stage + self-test, version manager, request queue, handoff store, shim registry, `core.db` | `tk-launcher` (external) | rare |
-| **L2 Services**      | `tk-services` | Orchestrator domain: facts, sessions, views, documents, decisions, automation, resources, non-agent plugins, MCP tool implementations, `tratschkathl.db` | Core | often |
+| **L2 Services**      | `tk-services` | Orchestrator domain: facts, sessions, views, documents, decisions, automation, resources, non-agent plugins, MCP tool implementations. State as files: `sessions/<id>/session.json` and `facts.jsonl` | Core | often |
 | **L3 Agent Handler** | `tk-agents`   | ACP client, terminal emulation (VT state via `alacritty_terminal`), agent plugins (Claude), session lifecycle (start, resume, cancel), MCP config injection | Core | medium |
 | **L4 UI**            | `tk-ui`       | GPUI workbench (windows, docks, panes, tabs), navigator views, chat and terminal rendering, document renderers. **No domain state** | Core | very often |
 

@@ -12,7 +12,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-rusqlite.workspace = true
 tk-plugin-api.workspace = true
 tk-plugin-git.workspace = true
 toml.workspace = true

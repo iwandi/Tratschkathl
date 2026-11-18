@@ -72,7 +72,7 @@ async fn main() {
             async move { a.handle(inc).await }
         })
     };
-    let (bus, mut events) = Bus::connect("agents", env!("CARGO_PKG_VERSION"), vec!["ui.".into()], Some(h));
+    let (bus, mut events) = Bus::connect("agents", env!("CARGO_PKG_VERSION"), vec!["ui.".into(), "layer.up".into()], Some(h));
     let _ = agents.bus.set(bus.clone());
 
     // UI input events.
@@ -80,6 +80,12 @@ async fn main() {
         let a = agents.clone();
         tokio::spawn(async move {
             while let Some((topic, data)) = events.recv().await {
+                if topic == "layer.up" {
+                    if data["role"] == "services" {
+                        a.reregister().await;
+                    }
+                    continue;
+                }
                 a.on_ui_event(&topic, &data);
             }
         });
@@ -224,6 +230,23 @@ impl Agents {
                 Ok(json!({ "session": id, "from": 0, "items": chat.items, "state": "ended" }))
             }
             other => Err(format!("agents: unknown method {other}")),
+        }
+    }
+
+    /// The Agent Handler knows which sessions are alive (it is attached to their shims). When
+    /// Services (re)starts, tell it again, so its registry heals after any state loss.
+    async fn reregister(&self) {
+        let infos: Vec<SessionInfo> =
+            self.sessions.lock().unwrap().values().map(|s| s.lock().unwrap().info.clone()).collect();
+        for mut info in infos {
+            info.state = "running".into();
+            if let Err(e) = self
+                .bus()
+                .request_timeout("services", "session.register", serde_json::to_value(&info).unwrap(), Duration::from_secs(30))
+                .await
+            {
+                tracing::warn!("re-registering {} failed: {e}", info.id);
+            }
         }
     }
 

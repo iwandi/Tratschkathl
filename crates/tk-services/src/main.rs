@@ -5,6 +5,7 @@ mod commands;
 mod decisions;
 mod facts;
 mod files;
+mod store;
 mod tools;
 mod versioned;
 mod views;
@@ -13,7 +14,6 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
 use tk_bus::model::{parse_doc_uri, DocRef, Document, FactInput, SessionInfo};
@@ -21,7 +21,8 @@ use tk_bus::{client::handler, Bus, Incoming};
 use tk_plugin_api::{Plugin, SessionContext};
 
 pub struct Services {
-    db: Mutex<Connection>,
+    /// Sessions and facts, kept in memory, persisted as files (see store.rs).
+    store: Mutex<store::Store>,
     bus: OnceLock<Bus>,
     plugins: Vec<Box<dyn Plugin>>,
 }
@@ -29,11 +30,8 @@ pub struct Services {
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--self-test") {
-        // Prove the DB opens and migrates, and the view config parses.
-        if let Err(e) = open_db() {
-            eprintln!("db: {e}");
-            std::process::exit(1);
-        }
+        // Prove the session store loads and the view config parses.
+        let _ = store::Store::load(tk_bus::paths::sessions_dir());
         if let Err(e) = views::load() {
             eprintln!("{e}");
             std::process::exit(1);
@@ -42,14 +40,9 @@ async fn main() {
         return;
     }
     tk_bus::logging::init("services");
-    let db = match open_db() {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::error!("cannot open db: {e}");
-            std::process::exit(1);
-        }
-    };
-    let svc = Arc::new(Services { db: Mutex::new(db), bus: OnceLock::new(), plugins: plugins() });
+    let store = store::Store::load(tk_bus::paths::sessions_dir());
+    tracing::info!("loaded {} sessions, {} facts", store.sessions.len(), store.facts.len());
+    let svc = Arc::new(Services { store: Mutex::new(store), bus: OnceLock::new(), plugins: plugins() });
     let h = {
         let svc = svc.clone();
         handler(move |inc| {
@@ -71,25 +64,6 @@ fn plugins() -> Vec<Box<dyn Plugin>> {
     vec![Box::new(tk_plugin_git::GitPlugin), Box::new(files::FilesPlugin)]
 }
 
-fn open_db() -> rusqlite::Result<Connection> {
-    let _ = std::fs::create_dir_all(tk_bus::paths::home());
-    let db = Connection::open(tk_bus::paths::home().join("tratschkathl.db"))?;
-    db.execute_batch(
-        "PRAGMA journal_mode=WAL;
-         CREATE TABLE IF NOT EXISTS sessions (
-            id TEXT PRIMARY KEY,
-            kind TEXT NOT NULL,
-            agent TEXT NOT NULL,
-            title TEXT NOT NULL,
-            cwd TEXT NOT NULL,
-            state TEXT NOT NULL,
-            created_at INTEGER NOT NULL
-         );",
-    )?;
-    db.execute_batch(facts::SCHEMA)?;
-    Ok(db)
-}
-
 impl Services {
     pub fn emit(&self, topic: &str, data: Value) {
         if let Some(bus) = self.bus.get() {
@@ -106,14 +80,7 @@ impl Services {
             }
             "session.register" => {
                 let s: SessionInfo = serde_json::from_value(p.clone()).map_err(|e| e.to_string())?;
-                self.db
-                    .lock()
-                    .unwrap()
-                    .execute(
-                        "INSERT OR REPLACE INTO sessions (id, kind, agent, title, cwd, state, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                        params![s.id, s.kind, s.agent, s.title, s.cwd, s.state, s.created_at],
-                    )
-                    .map_err(|e| e.to_string())?;
+                self.store.lock().unwrap().put_session(s.clone())?;
                 self.emit("sessions.changed", json!({ "id": s.id }));
                 let me = self.clone();
                 tokio::spawn(async move { me.derive_for(&s).await });
@@ -122,13 +89,15 @@ impl Services {
             "session.update" => {
                 let id = p["id"].as_str().ok_or("id missing")?;
                 {
-                    let db = self.db.lock().unwrap();
+                    let mut store = self.store.lock().unwrap();
+                    let mut s = store.sessions.get(id).cloned().ok_or_else(|| format!("unknown session {id}"))?;
                     if let Some(state) = p["state"].as_str() {
-                        db.execute("UPDATE sessions SET state=?1 WHERE id=?2", params![state, id]).map_err(|e| e.to_string())?;
+                        s.state = state.to_string();
                     }
                     if let Some(title) = p["title"].as_str() {
-                        db.execute("UPDATE sessions SET title=?1 WHERE id=?2", params![title, id]).map_err(|e| e.to_string())?;
+                        s.title = title.to_string();
                     }
+                    store.put_session(s)?;
                 }
                 self.emit("sessions.changed", json!({ "id": id }));
                 Ok(json!(true))
@@ -140,22 +109,21 @@ impl Services {
                 let list: Vec<FactInput> = serde_json::from_value(p["facts"].clone()).unwrap_or_default();
                 let source = p["source"].as_str().unwrap_or("user");
                 {
-                    let db = self.db.lock().unwrap();
+                    let mut store = self.store.lock().unwrap();
                     for f in &list {
-                        facts::announce(&db, session, f, source, None)?;
+                        facts::announce(&mut store, session, f, source, None)?;
                     }
                 }
                 self.facts_changed(session);
                 Ok(json!(list.len()))
             }
             "fact.list" => {
-                let db = self.db.lock().unwrap();
-                let list = facts::current(&db, p["session"].as_str(), p["key"].as_str()).map_err(|e| e.to_string())?;
+                let list = facts::current(&self.store.lock().unwrap(), p["session"].as_str(), p["key"].as_str())?;
                 Ok(serde_json::to_value(list).unwrap())
             }
             "view.render" => {
                 let sessions = self.sessions(None)?;
-                let all = facts::current(&self.db.lock().unwrap(), None, None).map_err(|e| e.to_string())?;
+                let all = facts::current(&self.store.lock().unwrap(), None, None).map_err(|e| e.to_string())?;
                 let selection: std::collections::BTreeMap<String, String> =
                     serde_json::from_value(p["selection"].clone()).unwrap_or_default();
                 Ok(serde_json::to_value(views::render_all(&sessions, &all, &selection)?).unwrap())
@@ -180,7 +148,7 @@ impl Services {
 
     /// Documents every provider offers for a session's current facts (spec §4.4).
     pub fn documents_for(&self, session: &str) -> Result<Vec<DocRef>, String> {
-        let current = facts::current(&self.db.lock().unwrap(), Some(session), None).map_err(|e| e.to_string())?;
+        let current = facts::current(&self.store.lock().unwrap(), Some(session), None).map_err(|e| e.to_string())?;
         let mut out: Vec<DocRef> = vec![];
         // Built in: the project's decision log (.tk/decisions), and the host's own decisions.
         if let Some(project) = self.project_root(session) {
@@ -249,7 +217,7 @@ impl Services {
         let info = self.sessions(None)?.into_iter().find(|s| s.id == session);
         let cwd = info.as_ref().map(|s| s.cwd.clone()).unwrap_or_default();
         let mut facts_map = std::collections::BTreeMap::new();
-        for f in facts::current(&self.db.lock().unwrap(), Some(&session), None).map_err(|e| e.to_string())? {
+        for f in facts::current(&self.store.lock().unwrap(), Some(&session), None).map_err(|e| e.to_string())? {
             facts_map.entry(f.key).or_insert(f.value);
         }
         let action = commands::fill(&cmd.action, &session, &cwd, &facts_map);
@@ -284,7 +252,7 @@ impl Services {
 
     /// The project a session works in: its git worktree, or its folder outside git.
     pub fn project_root(&self, session: &str) -> Option<String> {
-        let current = facts::current(&self.db.lock().unwrap(), Some(session), Some("worktree")).ok()?;
+        let current = facts::current(&self.store.lock().unwrap(), Some(session), Some("worktree")).ok()?;
         if let Some(w) = current.first() {
             return Some(w.value.clone());
         }
@@ -296,27 +264,7 @@ impl Services {
     }
 
     pub fn sessions(&self, state: Option<&str>) -> Result<Vec<SessionInfo>, String> {
-        let db = self.db.lock().unwrap();
-        let mut stmt = db
-            .prepare("SELECT id, kind, agent, title, cwd, state, created_at FROM sessions ORDER BY created_at DESC")
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| {
-                Ok(SessionInfo {
-                    id: r.get(0)?,
-                    kind: r.get(1)?,
-                    agent: r.get(2)?,
-                    title: r.get(3)?,
-                    cwd: r.get(4)?,
-                    state: r.get(5)?,
-                    created_at: r.get(6)?,
-                })
-            })
-            .map_err(|e| e.to_string())?;
-        Ok(rows
-            .filter_map(Result::ok)
-            .filter(|s| state.map_or(true, |st| s.state == st))
-            .collect())
+        Ok(self.store.lock().unwrap().list(state))
     }
 
     /// Run every fact deriver for one session and apply the result.
@@ -328,8 +276,8 @@ impl Services {
             for plugin in &me.plugins {
                 let Some(d) = plugin.fact_deriver() else { continue };
                 let derived = d.derive(&ctx);
-                let db = me.db.lock().unwrap();
-                match facts::apply_derived(&db, &ctx.session, plugin.id(), &derived) {
+                let mut store = me.store.lock().unwrap();
+                match facts::apply_derived(&mut store, &ctx.session, plugin.id(), &derived) {
                     Ok(c) => changed |= c,
                     Err(e) => tracing::warn!("{}: deriving facts for {} failed: {e}", plugin.id(), ctx.session),
                 }
