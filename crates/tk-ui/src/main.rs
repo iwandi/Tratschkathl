@@ -2,6 +2,8 @@
 //! sessions come from Services, terminal frames from the Agent Handler. The layout is handed
 //! to the next UI version on reload.
 
+mod markdown;
+
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
@@ -16,7 +18,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use tk_bus::frame::{Frame, KeyInput, Run, BOLD, ITALIC, UNDERLINE};
-use tk_bus::model::{AgentConfig, Fact, FactInput, RenderedView, SessionInfo, TreeNode};
+use tk_bus::model::{AgentConfig, DocRef, Document, Fact, FactInput, RenderedView, SessionInfo, TreeNode, DOC_PREFIX};
 use tk_bus::settings::Settings;
 use tk_bus::{client::handler, Bus};
 
@@ -85,8 +87,23 @@ struct Workbench {
     collapsed: HashSet<String>,
     /// Node whose "+" agent picker is open.
     create_at: Option<String>,
-    /// Facts of the active session (session id, facts).
+    /// Facts of the context session (session id, facts).
     active_facts: (Option<String>, Vec<Fact>),
+    /// Documents offered for the context session.
+    active_docs: Vec<DocRef>,
+    /// The session the context dock shows: the active tab, or the last session tab when a
+    /// document tab is active.
+    last_session: Option<String>,
+    /// Loaded documents, refreshed while visible.
+    docs: HashMap<String, Document>,
+    doc_errors: HashMap<String, String>,
+    doc_inflight: HashSet<String>,
+    /// Collapsed files in changeset documents, by `uri#path`.
+    collapsed_files: HashSet<String>,
+}
+
+fn is_doc(id: &str) -> bool {
+    id.starts_with(DOC_PREFIX)
 }
 
 fn main() {
@@ -247,6 +264,18 @@ impl Workbench {
         })
         .detach();
 
+        // Visible documents are live: reload them every few seconds.
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor().timer(Duration::from_secs(3)).await;
+            let Ok(visible) = this.update(cx, |wb, _| wb.visible_docs()) else { break };
+            for uri in visible {
+                if this.update(cx, |wb, cx| wb.fetch_doc(uri.clone(), cx)).is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+
         let focus = cx.focus_handle();
         Workbench {
             bus,
@@ -268,6 +297,12 @@ impl Workbench {
             collapsed: HashSet::new(),
             create_at: None,
             active_facts: (None, vec![]),
+            active_docs: vec![],
+            last_session: None,
+            docs: HashMap::new(),
+            doc_errors: HashMap::new(),
+            doc_inflight: HashSet::new(),
+            collapsed_files: HashSet::new(),
         }
     }
 
@@ -305,6 +340,14 @@ impl Workbench {
     }
 
     fn session_title(&self, id: &str) -> String {
+        if is_doc(id) {
+            return self
+                .docs
+                .get(id)
+                .map(|d| d.title.clone())
+                .or_else(|| self.active_docs.iter().find(|d| d.uri == id).map(|d| d.title.clone()))
+                .unwrap_or_else(|| id.rsplit('/').next().unwrap_or(id).to_string());
+        }
         match self.session(id) {
             Some(s) => {
                 let folder = std::path::Path::new(&s.cwd)
@@ -396,10 +439,20 @@ impl Workbench {
             "facts.changed" => {
                 self.refresh_views(cx);
                 if data["session"].as_str() == self.active_facts.0.as_deref() {
-                    self.active_facts.0 = None; // refetched on next render
+                    self.active_facts.0 = None; // facts and documents refetched on next render
                 }
             }
             "views.changed" => self.refresh_views(cx),
+            "workbench.open_document" => {
+                if let Some(uri) = data["uri"].as_str() {
+                    if data["placement"].as_str() == Some("split") {
+                        let last = self.panes.len() - 1;
+                        self.split(last, cx);
+                    }
+                    self.open_tab(uri);
+                    self.fetch_doc(uri.to_string(), cx);
+                }
+            }
             "workbench.focus" => {
                 if let Some(id) = data["session"].as_str() {
                     self.open_tab(id);
@@ -498,28 +551,73 @@ impl Workbench {
     }
 
     /// Keep the context dock's facts in step with the active session.
+    fn active_tab(&self) -> Option<String> {
+        self.panes.get(self.active_pane).and_then(|p| p.tabs.get(p.active)).cloned()
+    }
+
+    /// The session the context dock is about.
+    fn context_session(&self) -> Option<String> {
+        match self.active_tab() {
+            Some(t) if !is_doc(&t) => Some(t),
+            _ => self.last_session.clone(),
+        }
+    }
+
+    /// Keep the context dock's facts and documents in step with the context session.
     fn sync_active_facts(&mut self, cx: &mut Context<Self>) {
-        let active = self.panes.get(self.active_pane).and_then(|p| p.tabs.get(p.active)).cloned();
-        if active == self.active_facts.0 && active.is_some() {
+        if let Some(t) = self.active_tab().filter(|t| !is_doc(t)) {
+            self.last_session = Some(t);
+        }
+        let ctx = self.context_session();
+        if ctx == self.active_facts.0 && ctx.is_some() {
             return;
         }
-        if active.is_none() {
+        let Some(sid) = ctx else {
             self.active_facts = (None, vec![]);
+            self.active_docs.clear();
+            return;
+        };
+        self.active_facts.0 = Some(sid.clone());
+        let bus = self.bus.clone();
+        cx.spawn(async move |this, cx| {
+            let facts = bus.request("services", "fact.list", json!({ "session": sid })).await;
+            let docs = bus.request("services", "document.list", json!({ "session": sid })).await;
+            let _ = this.update(cx, |wb, cx| {
+                if wb.active_facts.0.as_deref() == Some(sid.as_str()) {
+                    wb.active_facts.1 = facts.ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+                    wb.active_docs = docs.ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Document tabs that are currently shown in some pane.
+    fn visible_docs(&self) -> Vec<String> {
+        self.panes.iter().filter_map(|p| p.tabs.get(p.active)).filter(|t| is_doc(t)).cloned().collect()
+    }
+
+    fn fetch_doc(&mut self, uri: String, cx: &mut Context<Self>) {
+        if !self.doc_inflight.insert(uri.clone()) {
             return;
         }
-        self.active_facts.0 = active.clone();
         let bus = self.bus.clone();
-        let sid = active.unwrap();
         cx.spawn(async move |this, cx| {
-            if let Ok(v) = bus.request("services", "fact.list", json!({ "session": sid })).await {
-                let facts: Vec<Fact> = serde_json::from_value(v).unwrap_or_default();
-                let _ = this.update(cx, |wb, cx| {
-                    if wb.active_facts.0.as_deref() == Some(sid.as_str()) {
-                        wb.active_facts.1 = facts;
-                        cx.notify();
+            let res = bus.request("services", "document.get", json!({ "uri": uri })).await;
+            let _ = this.update(cx, |wb, cx| {
+                wb.doc_inflight.remove(&uri);
+                match res.and_then(|v| serde_json::from_value::<Document>(v).map_err(|e| e.to_string())) {
+                    Ok(doc) => {
+                        wb.doc_errors.remove(&uri);
+                        wb.docs.insert(uri, doc);
                     }
-                });
-            }
+                    Err(e) => {
+                        wb.doc_errors.insert(uri, e);
+                    }
+                }
+                cx.notify();
+            });
         })
         .detach();
     }
@@ -559,7 +657,7 @@ impl Workbench {
         let cols = (pane_w / self.cell_w).floor().max(10.0) as u16;
         let rows = (pane_h / self.line_h).floor().max(4.0) as u16;
         for p in &self.panes {
-            if let Some(sid) = p.tabs.get(p.active) {
+            if let Some(sid) = p.tabs.get(p.active).filter(|t| !is_doc(t)) {
                 if self.sent_sizes.get(sid) != Some(&(cols, rows)) {
                     self.sent_sizes.insert(sid.clone(), (cols, rows));
                     self.bus.emit("ui.resize", json!({ "session": sid, "cols": cols, "rows": rows }));
@@ -760,12 +858,9 @@ impl Workbench {
         }
     }
 
-    fn render_right(&self) -> impl IntoElement {
-        let active = self
-            .panes
-            .get(self.active_pane)
-            .and_then(|p| p.tabs.get(p.active))
-            .and_then(|sid| self.session(sid));
+    fn render_right(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ctx = self.context_session();
+        let active = ctx.as_deref().and_then(|sid| self.session(sid));
         let row = |k: &str, v: String| {
             div()
                 .px_3()
@@ -786,7 +881,7 @@ impl Workbench {
                     .child(section_header("FACTS"))
                     .child(self.render_facts(&s.id))
                     .child(section_header("DOCUMENTS"))
-                    .child(div().px_3().text_color(rgb(DIM)).child("none yet (M2)"));
+                    .child(self.render_doc_list(cx));
             }
             None => body = body.child(div().px_3().text_color(rgb(DIM)).child("No active session")),
         }
@@ -831,6 +926,164 @@ impl Workbench {
                     }))
             }))
             .into_any_element()
+    }
+
+    fn render_doc_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self.active_docs.is_empty() {
+            return div().px_3().text_color(rgb(DIM)).child("none").into_any_element();
+        }
+        let open = self.active_tab();
+        div()
+            .flex()
+            .flex_col()
+            .children(self.active_docs.iter().enumerate().map(|(i, d)| {
+                let uri = d.uri.clone();
+                let selected = open.as_deref() == Some(d.uri.as_str());
+                div()
+                    .id(("doc", i))
+                    .px_3()
+                    .py(px(3.0))
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .when(selected, |x| x.bg(rgb(BTN_HOVER)))
+                    .hover(|x| x.bg(rgb(BTN)))
+                    .child(div().flex_none().text_xs().text_color(rgb(DIM)).child(match d.kind.as_str() {
+                        "changeset" => "±",
+                        "markdown" => "¶",
+                        _ => "•",
+                    }))
+                    .child(div().flex_1().min_w_0().truncate().child(d.title.clone()))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.open_tab(&uri);
+                        this.fetch_doc(uri.clone(), cx);
+                        cx.notify();
+                    }))
+            }))
+            .into_any_element()
+    }
+
+    fn render_document(&self, pi: usize, uri: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let body: gpui::AnyElement = match (self.docs.get(uri), self.doc_errors.get(uri)) {
+            (_, Some(err)) => div().text_color(rgb(0xf48771)).child(err.clone()).into_any_element(),
+            (None, None) => div().text_color(rgb(DIM)).child("loading…").into_any_element(),
+            (Some(doc), None) => match doc.kind.as_str() {
+                "markdown" => markdown::render(doc.body["text"].as_str().unwrap_or(""), self.font_family.clone()),
+                "changeset" => self.render_changeset(doc, cx),
+                other => div().text_color(rgb(DIM)).child(format!("no renderer for document kind '{other}'")).into_any_element(),
+            },
+        };
+        div()
+            .id(SharedString::from(format!("doc-{pi}")))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .bg(rgb(TERM_BG))
+            .p_4()
+            .child(body)
+            .into_any_element()
+    }
+
+    fn render_changeset(&self, doc: &Document, cx: &mut Context<Self>) -> gpui::AnyElement {
+        const MAX_LINES_PER_FILE: usize = 400;
+        let b = &doc.body;
+        let files = b["files"].as_array().cloned().unwrap_or_default();
+        let (added, removed) = files.iter().fold((0, 0), |(a, r), f| {
+            (a + f["added"].as_u64().unwrap_or(0), r + f["removed"].as_u64().unwrap_or(0))
+        });
+        let many = files.len() > 8;
+        let mut col = div().flex().flex_col().gap_1().child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .items_center()
+                .pb_2()
+                .child(div().text_size(px(18.0)).font_weight(FontWeight::BOLD).child(doc.title.clone()))
+                .child(div().text_color(rgb(DIM)).child(format!("{} files", files.len())))
+                .child(div().text_color(rgb(0x23d18b)).child(format!("+{added}")))
+                .child(div().text_color(rgb(0xf14c4c)).child(format!("−{removed}")))
+                .child(div().text_xs().text_color(rgb(DIM)).child(b["root"].as_str().unwrap_or("").to_string())),
+        );
+        if files.is_empty() {
+            col = col.child(div().text_color(rgb(DIM)).child("No uncommitted changes."));
+        }
+        if b["truncated"].as_bool() == Some(true) {
+            col = col.child(div().text_xs().text_color(rgb(0xe5e510)).child("Diff truncated (very large)."));
+        }
+        for (i, f) in files.iter().enumerate() {
+            let path = f["path"].as_str().unwrap_or("").to_string();
+            let key = format!("{}#{}", doc.uri, path);
+            // Large changesets start collapsed; the set records the user's toggles.
+            let collapsed = self.collapsed_files.contains(&key) != many;
+            let status = f["status"].as_str().unwrap_or("M").to_string();
+            let status_color = match status.as_str() {
+                "A" | "?" => 0x23d18b,
+                "D" => 0xf14c4c,
+                _ => 0xe5c07b,
+            };
+            let toggle = key.clone();
+            col = col.child(
+                div()
+                    .id(("file", i))
+                    .mt_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .bg(rgb(PANEL))
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|x| x.bg(rgb(BTN)))
+                    .child(div().w(px(12.0)).text_xs().text_color(rgb(DIM)).child(if collapsed { "▸" } else { "▾" }))
+                    .child(div().w(px(14.0)).text_color(rgb(status_color)).child(status))
+                    .child(div().flex_1().min_w_0().truncate().child(path.clone()))
+                    .child(div().text_xs().text_color(rgb(0x23d18b)).child(format!("+{}", f["added"].as_u64().unwrap_or(0))))
+                    .child(div().text_xs().text_color(rgb(0xf14c4c)).child(format!("−{}", f["removed"].as_u64().unwrap_or(0))))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if !this.collapsed_files.remove(&toggle) {
+                            this.collapsed_files.insert(toggle.clone());
+                        }
+                        cx.notify();
+                    })),
+            );
+            if !collapsed {
+                let diff = f["diff"].as_str().unwrap_or("");
+                let lines: Vec<&str> = diff.lines().collect();
+                let shown = lines.len().min(MAX_LINES_PER_FILE);
+                let mut block = div()
+                    .flex()
+                    .flex_col()
+                    .font_family(self.font_family.clone())
+                    .text_size(px(13.0))
+                    .line_height(px(18.0));
+                for l in &lines[..shown] {
+                    let (fg, bg) = if l.starts_with("@@") {
+                        (0x569cd6, None)
+                    } else if l.starts_with('+') {
+                        (0x9cdc9c, Some(0x1f3a26))
+                    } else if l.starts_with('-') {
+                        (0xf48771, Some(0x4a1f22))
+                    } else {
+                        (0xb0b0b0, None)
+                    };
+                    let mut row = div().px_2().whitespace_nowrap().overflow_hidden().text_color(rgb(fg)).child(l.replace('\t', "    "));
+                    if let Some(bg) = bg {
+                        row = row.bg(rgb(bg));
+                    }
+                    block = block.child(row);
+                }
+                if lines.len() > shown {
+                    block = block.child(div().px_2().text_color(rgb(DIM)).child(format!("… {} more lines", lines.len() - shown)));
+                }
+                col = col.child(block);
+            }
+        }
+        col.into_any_element()
     }
 
     fn render_pane(&self, pi: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -904,6 +1157,7 @@ impl Workbench {
             );
 
         let content = match pane.tabs.get(pane.active) {
+            Some(uri) if is_doc(uri) => self.render_document(pi, uri, cx),
             Some(sid) => self.render_terminal(pi, sid, cx).into_any_element(),
             None => div()
                 .flex_1()
@@ -1010,6 +1264,11 @@ impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_sizes(window);
         self.sync_active_facts(cx);
+        for uri in self.visible_docs() {
+            if !self.docs.contains_key(&uri) && !self.doc_errors.contains_key(&uri) {
+                self.fetch_doc(uri, cx);
+            }
+        }
         if self.want_focus {
             self.want_focus = false;
             if let Some(p) = self.panes.get(self.active_pane) {
@@ -1034,7 +1293,7 @@ impl Render for Workbench {
                     .flex_row()
                     .child(self.render_left(cx))
                     .child(div().flex_1().min_w_0().h_full().flex().flex_row().children(panes))
-                    .child(self.render_right()),
+                    .child(self.render_right(cx)),
             )
             .child(
                 div()

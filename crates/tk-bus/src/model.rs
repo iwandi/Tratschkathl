@@ -104,6 +104,40 @@ pub struct RenderedView {
     pub root: TreeNode,
 }
 
+/// A document a provider offers for a session's facts (spec §4.4).
+/// `uri` is `tk://doc/<kind>/<provider>/<ref>`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DocRef {
+    pub uri: String,
+    pub kind: String,
+    pub title: String,
+    pub provider: String,
+}
+
+/// A document's content. `body` depends on `kind`:
+/// - `markdown`: `{ path, text }`
+/// - `changeset`: `{ root, branch, files: [{ path, status, added, removed, diff }], truncated }`
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Document {
+    pub uri: String,
+    pub kind: String,
+    pub title: String,
+    pub body: serde_json::Value,
+}
+
+pub const DOC_PREFIX: &str = "tk://doc/";
+
+pub fn doc_uri(kind: &str, provider: &str, reference: &str) -> String {
+    format!("{DOC_PREFIX}{kind}/{provider}/{reference}")
+}
+
+/// Split a document URI into (kind, provider, ref).
+pub fn parse_doc_uri(uri: &str) -> Option<(&str, &str, &str)> {
+    let rest = uri.strip_prefix(DOC_PREFIX)?;
+    let mut it = rest.splitn(3, '/');
+    Some((it.next()?, it.next()?, it.next()?))
+}
+
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

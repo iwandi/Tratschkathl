@@ -78,6 +78,23 @@ pub fn defs() -> Value {
             }
         },
         {
+            "name": "document_list",
+            "description": "List the documents Tratschkathl offers for a session's facts (default: your own session): e.g. the worktree's uncommitted changes (changeset) and its Markdown files. Announce a `doc` fact with a file path to add a specific Markdown file.",
+            "inputSchema": { "type": "object", "properties": { "session": { "type": "string" } } }
+        },
+        {
+            "name": "document_open",
+            "description": "Open a document in the user's workbench, e.g. to show them the changes you made or a design doc you wrote. Takes a uri from document_list.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "uri": { "type": "string" },
+                    "placement": { "type": "string", "enum": ["tab", "split"], "description": "Default: a tab in the active pane." }
+                },
+                "required": ["uri"]
+            }
+        },
+        {
             "name": "session_focus",
             "description": "Bring a session to the front of the user's workbench (opens or activates its tab). Without a session id it focuses your own session.",
             "inputSchema": { "type": "object", "properties": { "session": { "type": "string" } } }
@@ -145,6 +162,16 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
             sessions_with_facts(svc, |id| ids.iter().any(|i| i == id), None)
         }
         "session_list" => sessions_with_facts(svc, |_| true, args["state"].as_str()),
+        "document_list" => {
+            ensure_session(&target)?;
+            Ok(serde_json::to_value(svc.documents_for(&target)?).unwrap())
+        }
+        "document_open" => {
+            let uri = args["uri"].as_str().ok_or("uri missing")?;
+            tk_bus::model::parse_doc_uri(uri).ok_or("uri must come from document_list")?;
+            svc.emit("workbench.open_document", json!({ "uri": uri, "placement": args["placement"].as_str().unwrap_or("tab") }));
+            Ok(json!({ "opened": uri }))
+        }
         "session_focus" => {
             ensure_session(&target)?;
             svc.emit("workbench.focus", json!({ "session": target }));

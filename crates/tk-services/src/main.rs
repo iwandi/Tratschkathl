@@ -1,7 +1,8 @@
 //! L2 Services: session registry, fact store, view engine, tool registry, and the plugin host
-//! for non-agent plugins (M1: the Git fact deriver).
+//! for non-agent plugins (Git: facts and changesets; files: Markdown documents).
 
 mod facts;
+mod files;
 mod tools;
 mod views;
 
@@ -12,7 +13,7 @@ use std::time::{Duration, SystemTime};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use tk_bus::model::{FactInput, SessionInfo};
+use tk_bus::model::{parse_doc_uri, DocRef, Document, FactInput, SessionInfo};
 use tk_bus::{client::handler, Bus, Incoming};
 use tk_plugin_api::{Plugin, SessionContext};
 
@@ -64,7 +65,7 @@ async fn main() {
 
 /// Plugins compiled into this layer (spec §5.2, v1 model).
 fn plugins() -> Vec<Box<dyn Plugin>> {
-    vec![Box::new(tk_plugin_git::GitPlugin)]
+    vec![Box::new(tk_plugin_git::GitPlugin), Box::new(files::FilesPlugin)]
 }
 
 fn open_db() -> rusqlite::Result<Connection> {
@@ -154,10 +155,49 @@ impl Services {
                 let all = facts::current(&self.db.lock().unwrap(), None, None).map_err(|e| e.to_string())?;
                 Ok(serde_json::to_value(views::render_all(&sessions, &all)?).unwrap())
             }
+            "document.list" => {
+                let session = p["session"].as_str().ok_or("session missing")?;
+                Ok(serde_json::to_value(self.documents_for(session)?).unwrap())
+            }
+            "document.get" => {
+                let uri = p["uri"].as_str().ok_or("uri missing")?.to_string();
+                let me = self.clone();
+                let doc = tokio::task::spawn_blocking(move || me.document(&uri)).await.map_err(|e| e.to_string())??;
+                Ok(serde_json::to_value(doc).unwrap())
+            }
             "tools.list" => Ok(tools::defs()),
             "tool.call" => tools::call(self, p),
             other => Err(format!("services: unknown method {other}")),
         }
+    }
+
+    /// Documents every provider offers for a session's current facts (spec §4.4).
+    pub fn documents_for(&self, session: &str) -> Result<Vec<DocRef>, String> {
+        let current = facts::current(&self.db.lock().unwrap(), Some(session), None).map_err(|e| e.to_string())?;
+        let mut out: Vec<DocRef> = vec![];
+        for p in &self.plugins {
+            if let Some(d) = p.document_provider() {
+                for r in d.list(&current) {
+                    if !out.iter().any(|x| x.uri == r.uri) {
+                        out.push(r);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn document(&self, uri: &str) -> Result<Document, String> {
+        let (kind, provider, reference) = parse_doc_uri(uri).ok_or_else(|| format!("not a document uri: {uri}"))?;
+        let plugin = self
+            .plugins
+            .iter()
+            .find(|p| p.id() == provider)
+            .ok_or_else(|| format!("no plugin '{provider}'"))?;
+        plugin
+            .document_provider()
+            .ok_or_else(|| format!("plugin '{provider}' provides no documents"))?
+            .get(kind, reference)
     }
 
     pub fn facts_changed(&self, session: &str) {
