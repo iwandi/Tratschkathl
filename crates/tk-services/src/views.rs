@@ -27,21 +27,16 @@ struct ViewFile {
     views: Vec<ViewConfig>,
 }
 
+/// `views.toml`, agent-editable with history (`view_config_get` / `view_config_set`).
+pub const FILE: crate::versioned::VersionedFile = crate::versioned::VersionedFile { name: "views", default_text: DEFAULT_VIEWS };
+
 pub fn path() -> std::path::PathBuf {
-    tk_bus::paths::home().join("views.toml")
+    FILE.path()
 }
 
 /// Load the view config, writing the default on first use.
 pub fn load() -> Result<Vec<ViewConfig>, String> {
-    let p = path();
-    let text = match std::fs::read_to_string(&p) {
-        Ok(t) => t,
-        Err(_) => {
-            let _ = std::fs::write(&p, DEFAULT_VIEWS);
-            DEFAULT_VIEWS.to_string()
-        }
-    };
-    parse(&text)
+    parse(&FILE.text())
 }
 
 pub fn parse(text: &str) -> Result<Vec<ViewConfig>, String> {

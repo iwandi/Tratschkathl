@@ -156,6 +156,7 @@ fn main() {
                 "facts.".into(),
                 "views.".into(),
                 "chat.".into(),
+                "decisions.".into(),
             ],
             Some(h),
         )
@@ -376,7 +377,13 @@ impl Workbench {
     /// A one-character marker for what a tab holds.
     fn kind_marker(&self, id: &str) -> &'static str {
         if is_doc(id) {
-            return if id.contains("/changeset/") { "±" } else { "¶" };
+            return if id.contains("/changeset/") {
+                "±"
+            } else if id.contains("/decision-list/") {
+                "⚖"
+            } else {
+                "¶"
+            };
         }
         match self.session(id).map(|s| s.kind.as_str()) {
             Some("chat") => "◆",
@@ -499,6 +506,11 @@ impl Workbench {
             }
             "views.changed" => self.refresh_views(cx),
             "chat.items" => self.apply_chat(&data),
+            "decisions.changed" => {
+                for uri in self.visible_docs().into_iter().filter(|u| u.contains("/decision-list/")) {
+                    self.fetch_doc(uri, cx);
+                }
+            }
             "workbench.open_document" => {
                 if let Some(uri) = data["uri"].as_str() {
                     if data["placement"].as_str() == Some("split") {
@@ -1294,6 +1306,7 @@ impl Workbench {
                     .child(div().flex_none().text_xs().text_color(rgb(DIM)).child(match d.kind.as_str() {
                         "changeset" => "±",
                         "markdown" => "¶",
+                        "decision-list" => "⚖",
                         _ => "•",
                     }))
                     .child(div().flex_1().min_w_0().truncate().child(d.title.clone()))
@@ -1313,6 +1326,7 @@ impl Workbench {
             (Some(doc), None) => match doc.kind.as_str() {
                 "markdown" => markdown::render(doc.body["text"].as_str().unwrap_or(""), self.font_family.clone()),
                 "changeset" => self.render_changeset(doc, cx),
+                "decision-list" => render_decisions(doc),
                 other => div().text_color(rgb(DIM)).child(format!("no renderer for document kind '{other}'")).into_any_element(),
             },
         };
@@ -1595,6 +1609,72 @@ fn section_header(text: &str) -> impl IntoElement {
         .font_weight(FontWeight::BOLD)
         .text_color(rgb(DIM))
         .child(text.to_string())
+}
+
+/// The decision log as cards: title, what was decided and why, alternatives, source, time.
+fn render_decisions(doc: &Document) -> gpui::AnyElement {
+    let entries = doc.body["entries"].as_array().cloned().unwrap_or_default();
+    let mut col = div()
+        .flex()
+        .flex_col()
+        .gap_3()
+        .child(div().text_size(px(18.0)).font_weight(FontWeight::BOLD).child(doc.title.clone()));
+    if entries.is_empty() {
+        col = col.child(div().text_color(rgb(DIM)).child("No decisions logged yet. Agents log them with decision_log."));
+    }
+    for e in entries {
+        let s = |k: &str| e[k].as_str().filter(|v| !v.is_empty()).map(String::from);
+        let when = e["at"].as_i64().map(format_time).unwrap_or_default();
+        let source = e["source"].as_str().unwrap_or("").to_string();
+        let mut card = div()
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .child(div().flex_1().font_weight(FontWeight::BOLD).child(s("title").unwrap_or_default()))
+                    .child(div().text_xs().text_color(rgb(DIM)).child(format!("{source} · {when}"))),
+            );
+        for (label, key) in [("Decision", "decision"), ("Why", "rationale"), ("Alternatives", "alternatives"), ("Context", "context")] {
+            if let Some(v) = s(key) {
+                card = card.child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .child(div().w(px(90.0)).flex_none().text_color(rgb(DIM)).child(label))
+                        .child(div().flex_1().min_w_0().child(v)),
+                );
+            }
+        }
+        col = col.child(card);
+    }
+    col.into_any_element()
+}
+
+/// `YYYY-MM-DD HH:MM` (UTC) from epoch milliseconds, without a date crate.
+fn format_time(ms: i64) -> String {
+    let secs = ms / 1000;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Civil-from-days (Howard Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
+    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60)
 }
 
 impl Render for Workbench {

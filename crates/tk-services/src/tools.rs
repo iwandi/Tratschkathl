@@ -78,6 +78,50 @@ pub fn defs() -> Value {
             }
         },
         {
+            "name": "decision_log",
+            "description": "Record a decision you took, so humans and other sessions can see why things are the way they are. Log real choices (architecture, library, approach, scope cut), not routine steps. The decision is tagged with your session's facts (project, issue, ...) and shows up in the Decisions document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Short name of the decision" },
+                    "context": { "type": "string", "description": "The situation that required a decision" },
+                    "decision": { "type": "string", "description": "What was decided" },
+                    "alternatives": { "type": "string", "description": "Options considered and not taken" },
+                    "rationale": { "type": "string", "description": "Why" },
+                    "session": { "type": "string" }
+                },
+                "required": ["title", "decision", "rationale"]
+            }
+        },
+        {
+            "name": "decision_list",
+            "description": "List logged decisions, newest first. Filter by facts, e.g. {\"project\": \"Tratschkathl\"} or {\"issue\": \"PROJ-1\"}; source \"core\" lists the host's automatic decisions (reloads, rollbacks).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "filter": { "type": "object", "additionalProperties": { "type": "string" } },
+                    "source": { "type": "string" },
+                    "limit": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "view_config_get",
+            "description": "Read the workbench view config (views.toml): the views the user sees, e.g. trees nested by fact keys, boards with columns by a fact, continuation chains. Also returns the ids of earlier versions.",
+            "inputSchema": { "type": "object", "properties": { "version": { "type": "string", "description": "An earlier version id to read instead of the current one." } } }
+        },
+        {
+            "name": "view_config_set",
+            "description": "Replace the view config (complete TOML) or restore an earlier version. The config is validated first; the previous version is kept, so changes can be undone. Views are TOML [[view]] tables with id, title, type (tree | board | chain), dock (left | center | top) and type fields: tree: levels = [fact keys], create; board: column_key, columns = [values], filter = { key = \"value\" | \"$selected.<key>\" }, create, drag; chain: link_key (usually continues), label_key (usually phase), scope = \"$selected.<key>\". Call view_config_get first and keep views you do not mean to change.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "toml": { "type": "string", "description": "The complete new views.toml" },
+                    "restore": { "type": "string", "description": "Instead of toml: an earlier version id to restore." }
+                }
+            }
+        },
+        {
             "name": "document_list",
             "description": "List the documents Tratschkathl offers for a session's facts (default: your own session): e.g. the worktree's uncommitted changes (changeset) and its Markdown files. Announce a `doc` fact with a file path to add a specific Markdown file.",
             "inputSchema": { "type": "object", "properties": { "session": { "type": "string" } } }
@@ -162,6 +206,61 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
             sessions_with_facts(svc, |id| ids.iter().any(|i| i == id), None)
         }
         "session_list" => sessions_with_facts(svc, |_| true, args["state"].as_str()),
+        "decision_log" => {
+            let cur = facts::current(&svc.db.lock().unwrap(), Some(&target), None).map_err(|e| e.to_string())?;
+            let mut snapshot = std::collections::BTreeMap::new();
+            for f in cur {
+                snapshot.entry(f.key).or_insert(f.value);
+            }
+            let s = |k: &str| args[k].as_str().filter(|v| !v.is_empty()).map(String::from);
+            let d = crate::decisions::Decision {
+                session: (!target.is_empty() && target != "ctl").then(|| target.clone()),
+                source: source.to_string(),
+                title: args["title"].as_str().unwrap_or("").to_string(),
+                context: s("context"),
+                decision: s("decision"),
+                alternatives: s("alternatives"),
+                rationale: s("rationale"),
+                facts: snapshot,
+                ..Default::default()
+            };
+            let id = crate::decisions::log(&svc.db.lock().unwrap(), &d)?;
+            svc.emit("decisions.changed", json!({ "id": id }));
+            Ok(json!({ "id": id, "tagged_with": d.facts }))
+        }
+        "decision_list" => {
+            let filter: std::collections::BTreeMap<String, String> = args["filter"]
+                .as_object()
+                .map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                .unwrap_or_default();
+            let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+            let list = crate::decisions::list(&svc.db.lock().unwrap(), &filter, args["source"].as_str(), limit)?;
+            Ok(serde_json::to_value(list).unwrap())
+        }
+        "view_config_get" => {
+            let file = &crate::views::FILE;
+            let text = match args["version"].as_str() {
+                Some(v) => file.version_text(v)?,
+                None => file.text(),
+            };
+            Ok(json!({ "toml": text, "versions": file.versions() }))
+        }
+        "view_config_set" => {
+            let file = &crate::views::FILE;
+            let text = match (args["toml"].as_str(), args["restore"].as_str()) {
+                (Some(t), _) => t.to_string(),
+                (None, Some(v)) => file.version_text(v)?,
+                (None, None) => return Err("pass toml or restore".into()),
+            };
+            let saved = file.set(&text, |t| crate::views::parse(t).map(|_| ()))?;
+            svc.emit("views.changed", json!({}));
+            let views = crate::views::parse(&text)?;
+            Ok(json!({
+                "changed": saved.is_some(),
+                "previous_version": saved,
+                "views": views.iter().map(|v| json!({ "id": v.id, "type": v.kind, "dock": v.dock })).collect::<Vec<_>>()
+            }))
+        }
         "document_list" => {
             ensure_session(&target)?;
             Ok(serde_json::to_value(svc.documents_for(&target)?).unwrap())

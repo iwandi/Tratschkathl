@@ -1,9 +1,11 @@
 //! L2 Services: session registry, fact store, view engine, tool registry, and the plugin host
 //! for non-agent plugins (Git: facts and changesets; files: Markdown documents).
 
+mod decisions;
 mod facts;
 mod files;
 mod tools;
+mod versioned;
 mod views;
 
 use std::path::PathBuf;
@@ -84,6 +86,7 @@ fn open_db() -> rusqlite::Result<Connection> {
          );",
     )?;
     db.execute_batch(facts::SCHEMA)?;
+    db.execute_batch(decisions::SCHEMA)?;
     Ok(db)
 }
 
@@ -175,6 +178,19 @@ impl Services {
     pub fn documents_for(&self, session: &str) -> Result<Vec<DocRef>, String> {
         let current = facts::current(&self.db.lock().unwrap(), Some(session), None).map_err(|e| e.to_string())?;
         let mut out: Vec<DocRef> = vec![];
+        // Built in: the decision log, scoped to the session's issue or project.
+        let scope = current
+            .iter()
+            .find(|f| f.key == "issue")
+            .or_else(|| current.iter().find(|f| f.key == "project"));
+        if let Some(f) = scope {
+            out.push(DocRef {
+                uri: tk_bus::model::doc_uri("decision-list", "decisions", &format!("{}={}", f.key, f.value)),
+                kind: "decision-list".into(),
+                title: format!("Decisions · {}", f.value),
+                provider: "decisions".into(),
+            });
+        }
         for p in &self.plugins {
             if let Some(d) = p.document_provider() {
                 for r in d.list(&current) {
@@ -189,6 +205,22 @@ impl Services {
 
     pub fn document(&self, uri: &str) -> Result<Document, String> {
         let (kind, provider, reference) = parse_doc_uri(uri).ok_or_else(|| format!("not a document uri: {uri}"))?;
+        if provider == "decisions" {
+            // `<key>=<value>` scope, or `source=core` for the host's own decisions.
+            let (k, v) = reference.split_once('=').ok_or("bad decisions scope")?;
+            let db = self.db.lock().unwrap();
+            let entries = if k == "source" {
+                decisions::list(&db, &Default::default(), Some(v), 200)?
+            } else {
+                decisions::list(&db, &[(k.to_string(), v.to_string())].into(), None, 200)?
+            };
+            return Ok(Document {
+                uri: uri.to_string(),
+                kind: kind.to_string(),
+                title: if k == "source" { format!("Decisions · {v}") } else { format!("Decisions · {v}") },
+                body: json!({ "scope": { k: v }, "entries": entries }),
+            });
+        }
         let plugin = self
             .plugins
             .iter()
@@ -262,6 +294,12 @@ impl Services {
                 self.emit("views.changed", json!({}));
             }
             views_mtime = m;
+
+            // Core's automatic decisions (reloads, rollbacks) join the decision log.
+            let imported = decisions::import_core(&self.db.lock().unwrap());
+            if imported > 0 {
+                self.emit("decisions.changed", json!({ "imported": imported }));
+            }
 
             // Re-derive facts every 10 s: branches change under running sessions.
             if tick % 5 == 0 {
