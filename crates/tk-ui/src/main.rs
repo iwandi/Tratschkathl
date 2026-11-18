@@ -38,7 +38,7 @@ const DIM: u32 = 0x888888;
 const ACCENT: u32 = 0x3b8eea;
 const BTN: u32 = 0x2d2d2d;
 const BTN_HOVER: u32 = 0x3a3a3a;
-const TAB_ACTIVE: u32 = 0x1e1e1e;
+const TAB_INACTIVE: u32 = 0x181818;
 const TERM_BG: u32 = tk_term_bg();
 
 const fn tk_term_bg() -> u32 {
@@ -357,7 +357,43 @@ impl Workbench {
         self.sessions.iter().find(|s| s.id == id)
     }
 
+    /// Title shown for a session or document; sessions with the same base title get a short
+    /// id suffix so two "Claude Code" tabs can be told apart.
     fn session_title(&self, id: &str) -> String {
+        let base = self.base_title(id);
+        if is_doc(id) {
+            return base;
+        }
+        let twins = self.sessions.iter().filter(|s| s.id != id && self.base_title(&s.id) == base).count();
+        if twins > 0 {
+            format!("{base} · {}", &id[id.len().saturating_sub(4)..])
+        } else {
+            base
+        }
+    }
+
+    /// A one-character marker for what a tab holds.
+    fn kind_marker(&self, id: &str) -> &'static str {
+        if is_doc(id) {
+            return if id.contains("/changeset/") { "±" } else { "¶" };
+        }
+        match self.session(id).map(|s| s.kind.as_str()) {
+            Some("chat") => "◆",
+            _ => "❯",
+        }
+    }
+
+    fn kind_color(&self, id: &str) -> u32 {
+        if is_doc(id) {
+            return 0xe5c07b;
+        }
+        match self.session(id).map(|s| s.kind.as_str()) {
+            Some("chat") => 0xd670d6,
+            _ => 0x23d18b,
+        }
+    }
+
+    fn base_title(&self, id: &str) -> String {
         if is_doc(id) {
             return self
                 .docs
@@ -1405,21 +1441,41 @@ impl Workbench {
             .children(pane.tabs.iter().enumerate().map(|(ti, sid)| {
                 let active = ti == pane.active;
                 let ended = self.session(sid).map(|s| s.state != "running").unwrap_or(false);
+                // The active tab merges into the content (same background), carries an accent
+                // strip on top and bright text; inactive tabs are darker with dim text.
+                let strip = match (active, is_active) {
+                    (true, true) => ACCENT,
+                    (true, false) => 0x666666,
+                    _ => TAB_INACTIVE,
+                };
+                let text = match (active, ended) {
+                    (_, true) => 0x666666,
+                    (true, false) => 0xffffff,
+                    (false, false) => DIM,
+                };
                 div()
                     .id(SharedString::from(format!("tab-{pi}-{ti}")))
                     .h_full()
-                    .px_3()
                     .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
+                    .flex_col()
                     .cursor_pointer()
                     .border_r_1()
                     .border_color(rgb(BORDER))
-                    .bg(rgb(if active { TAB_ACTIVE } else { PANEL }))
-                    .text_color(rgb(if ended { DIM } else { TEXT }))
-                    .child(self.session_title(sid))
+                    .bg(rgb(if active { TERM_BG } else { TAB_INACTIVE }))
+                    .text_color(rgb(text))
+                    .when(!active, |d| d.hover(|s| s.bg(rgb(BTN))))
+                    .child(div().h(px(2.0)).w_full().flex_none().bg(rgb(strip)))
                     .child(
+                        div()
+                            .flex_1()
+                            .px_3()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap_2()
+                            .child(div().text_color(rgb(if active { self.kind_color(sid) } else { 0x666666 })).child(self.kind_marker(sid)))
+                            .child(self.session_title(sid))
+                            .child(
                         div()
                             .id(SharedString::from(format!("close-{pi}-{ti}")))
                             .px_1()
@@ -1432,6 +1488,7 @@ impl Workbench {
                                 this.close_tab(pi, ti);
                                 cx.notify();
                             })),
+                            ),
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         if let Some(p) = this.panes.get_mut(pi) {
