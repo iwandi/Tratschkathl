@@ -79,7 +79,7 @@ pub fn defs() -> Value {
         },
         {
             "name": "decision_log",
-            "description": "Record a decision you took, so humans and other sessions can see why things are the way they are. Log real choices (architecture, library, approach, scope cut), not routine steps. The decision is tagged with your session's facts (project, issue, ...) and shows up in the Decisions document.",
+            "description": "Record a decision you took, so humans and other sessions can see why things are the way they are. Log real choices (architecture, library, approach, scope cut), not routine steps. It is written as a Markdown file into the project's .tk/decisions/ folder (committed with the code), tagged with your session's facts (issue, phase, branch, ...). If it replaces an earlier decision, pass that file name as supersedes.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -88,20 +88,24 @@ pub fn defs() -> Value {
                     "decision": { "type": "string", "description": "What was decided" },
                     "alternatives": { "type": "string", "description": "Options considered and not taken" },
                     "rationale": { "type": "string", "description": "Why" },
-                    "session": { "type": "string" }
+                    "supersedes": { "type": "string", "description": "File name of an earlier decision this one replaces (from decision_list)." },
+                    "session": { "type": "string" },
+                    "project_dir": { "type": "string", "description": "Project folder, when not calling from a session." }
                 },
                 "required": ["title", "decision", "rationale"]
             }
         },
         {
             "name": "decision_list",
-            "description": "List logged decisions, newest first. Filter by facts, e.g. {\"project\": \"Tratschkathl\"} or {\"issue\": \"PROJ-1\"}; source \"core\" lists the host's automatic decisions (reloads, rollbacks).",
+            "description": "List the project's decisions (.tk/decisions), newest first, with status (accepted | superseded). Filter by tags, e.g. {\"issue\": \"PROJ-1\"}. source \"host\" lists Tratschkathl's own automatic decisions (reloads, rollbacks) instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "filter": { "type": "object", "additionalProperties": { "type": "string" } },
-                    "source": { "type": "string" },
-                    "limit": { "type": "integer" }
+                    "source": { "type": "string", "enum": ["project", "host"] },
+                    "limit": { "type": "integer" },
+                    "session": { "type": "string" },
+                    "project_dir": { "type": "string" }
                 }
             }
         },
@@ -206,36 +210,46 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
             sessions_with_facts(svc, |id| ids.iter().any(|i| i == id), None)
         }
         "session_list" => sessions_with_facts(svc, |_| true, args["state"].as_str()),
-        "decision_log" => {
-            let cur = facts::current(&svc.db.lock().unwrap(), Some(&target), None).map_err(|e| e.to_string())?;
-            let mut snapshot = std::collections::BTreeMap::new();
-            for f in cur {
-                snapshot.entry(f.key).or_insert(f.value);
+        "decision_log" | "decision_list" => {
+            let project = match args["project_dir"].as_str().filter(|p| !p.is_empty()) {
+                Some(p) => Some(p.to_string()),
+                None => svc.project_root(&target),
+            };
+            if name == "decision_list" {
+                let limit = args["limit"].as_u64().unwrap_or(50) as usize;
+                if args["source"].as_str() == Some("host") {
+                    return Ok(serde_json::to_value(crate::decisions::host(limit)).unwrap());
+                }
+                let project = project.ok_or("no project: call from a session or pass project_dir")?;
+                let filter: std::collections::BTreeMap<String, String> = args["filter"]
+                    .as_object()
+                    .map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
+                    .unwrap_or_default();
+                let list = crate::decisions::list(std::path::Path::new(&project), &filter, limit);
+                return Ok(json!({ "project": project, "decisions": list }));
             }
+            let project = project.ok_or("no project: call from a session or pass project_dir")?;
+            let cur = facts::current(&svc.db.lock().unwrap(), Some(&target), None).map_err(|e| e.to_string())?;
             let s = |k: &str| args[k].as_str().filter(|v| !v.is_empty()).map(String::from);
             let d = crate::decisions::Decision {
-                session: (!target.is_empty() && target != "ctl").then(|| target.clone()),
-                source: source.to_string(),
                 title: args["title"].as_str().unwrap_or("").to_string(),
+                source: source.to_string(),
+                session: svc.sessions(None)?.iter().any(|x| x.id == target).then(|| target.clone()),
+                supersedes: s("supersedes"),
+                tags: crate::decisions::tags_from(&cur),
                 context: s("context"),
                 decision: s("decision"),
                 alternatives: s("alternatives"),
                 rationale: s("rationale"),
-                facts: snapshot,
                 ..Default::default()
             };
-            let id = crate::decisions::log(&svc.db.lock().unwrap(), &d)?;
-            svc.emit("decisions.changed", json!({ "id": id }));
-            Ok(json!({ "id": id, "tagged_with": d.facts }))
-        }
-        "decision_list" => {
-            let filter: std::collections::BTreeMap<String, String> = args["filter"]
-                .as_object()
-                .map(|o| o.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect())
-                .unwrap_or_default();
-            let limit = args["limit"].as_u64().unwrap_or(50) as usize;
-            let list = crate::decisions::list(&svc.db.lock().unwrap(), &filter, args["source"].as_str(), limit)?;
-            Ok(serde_json::to_value(list).unwrap())
+            let written = crate::decisions::log(std::path::Path::new(&project), d, tk_bus::model::now_ms())?;
+            svc.emit("decisions.changed", json!({ "file": written.file }));
+            Ok(json!({
+                "file": crate::decisions::dir(std::path::Path::new(&project)).join(&written.file),
+                "tags": written.tags,
+                "note": "Commit the file with your change."
+            }))
         }
         "view_config_get" => {
             let file = &crate::views::FILE;

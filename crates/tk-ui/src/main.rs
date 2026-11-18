@@ -30,6 +30,8 @@ const RIGHT_W: f32 = 250.0;
 const STATUS_H: f32 = 26.0;
 const TAB_H: f32 = 32.0;
 const PAD: f32 = 6.0;
+const CHAIN_H: f32 = 36.0;
+const VIEW_PREFIX: &str = "tk://view/";
 
 const BG: u32 = 0x181818;
 const PANEL: u32 = 0x202020;
@@ -116,6 +118,31 @@ struct Workbench {
 
 fn is_doc(id: &str) -> bool {
     id.starts_with(DOC_PREFIX)
+}
+
+fn is_view(id: &str) -> bool {
+    id.starts_with(VIEW_PREFIX)
+}
+
+/// A board card being dragged.
+#[derive(Clone)]
+struct CardDrag {
+    session: String,
+    title: String,
+}
+
+impl Render for CardDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(0x264f78))
+            .text_color(rgb(0xffffff))
+            .text_sm()
+            .shadow_md()
+            .child(self.title.clone())
+    }
 }
 
 fn main() {
@@ -363,7 +390,7 @@ impl Workbench {
     /// id suffix so two "Claude Code" tabs can be told apart.
     fn session_title(&self, id: &str) -> String {
         let base = self.base_title(id);
-        if is_doc(id) {
+        if is_doc(id) || is_view(id) {
             return base;
         }
         let twins = self.sessions.iter().filter(|s| s.id != id && self.base_title(&s.id) == base).count();
@@ -376,6 +403,9 @@ impl Workbench {
 
     /// A one-character marker for what a tab holds.
     fn kind_marker(&self, id: &str) -> &'static str {
+        if is_view(id) {
+            return "▦";
+        }
         if is_doc(id) {
             return if id.contains("/changeset/") {
                 "±"
@@ -392,6 +422,9 @@ impl Workbench {
     }
 
     fn kind_color(&self, id: &str) -> u32 {
+        if is_view(id) {
+            return 0x3b8eea;
+        }
         if is_doc(id) {
             return 0xe5c07b;
         }
@@ -402,6 +435,14 @@ impl Workbench {
     }
 
     fn base_title(&self, id: &str) -> String {
+        if let Some(view_id) = id.strip_prefix(VIEW_PREFIX) {
+            return self
+                .views
+                .iter()
+                .find(|v| v.view.id == view_id)
+                .and_then(|v| v.view.title.clone())
+                .unwrap_or_else(|| view_id.to_string());
+        }
         if is_doc(id) {
             return self
                 .docs
@@ -605,8 +646,13 @@ impl Workbench {
 
     fn refresh_views(&self, cx: &mut Context<Self>) {
         let bus = self.bus.clone();
+        // `$selected.<key>` in view filters resolves against the context session's facts.
+        let mut selection = serde_json::Map::new();
+        for f in &self.active_facts.1 {
+            selection.entry(f.key.clone()).or_insert(json!(f.value));
+        }
         cx.spawn(async move |this, cx| {
-            let res = bus.request("services", "view.render", json!({})).await;
+            let res = bus.request("services", "view.render", json!({ "selection": selection })).await;
             let _ = this.update(cx, |wb, cx| {
                 match res.and_then(|v| serde_json::from_value::<Vec<RenderedView>>(v).map_err(|e| e.to_string())) {
                     Ok(v) => wb.views = v,
@@ -626,14 +672,14 @@ impl Workbench {
     /// The session the context dock is about.
     fn context_session(&self) -> Option<String> {
         match self.active_tab() {
-            Some(t) if !is_doc(&t) => Some(t),
+            Some(t) if !is_doc(&t) && !is_view(&t) => Some(t),
             _ => self.last_session.clone(),
         }
     }
 
     /// Keep the context dock's facts and documents in step with the context session.
     fn sync_active_facts(&mut self, cx: &mut Context<Self>) {
-        if let Some(t) = self.active_tab().filter(|t| !is_doc(t)) {
+        if let Some(t) = self.active_tab().filter(|t| !is_doc(t) && !is_view(t)) {
             self.last_session = Some(t);
         }
         let ctx = self.context_session();
@@ -654,6 +700,7 @@ impl Workbench {
                 if wb.active_facts.0.as_deref() == Some(sid.as_str()) {
                     wb.active_facts.1 = facts.ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
                     wb.active_docs = docs.ok().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
+                    wb.refresh_views(cx);
                     cx.notify();
                 }
             });
@@ -721,11 +768,12 @@ impl Workbench {
         let h = f32::from(vp.height);
         let n = self.panes.len().max(1) as f32;
         let pane_w = (w - LEFT_W - RIGHT_W) / n - 2.0 * PAD - 2.0;
-        let pane_h = h - STATUS_H - TAB_H - 2.0 * PAD - 2.0;
+        let chain_h = if self.views.iter().any(|v| v.view.dock == "top") { CHAIN_H } else { 0.0 };
+        let pane_h = h - STATUS_H - TAB_H - chain_h - 2.0 * PAD - 2.0;
         let cols = (pane_w / self.cell_w).floor().max(10.0) as u16;
         let rows = (pane_h / self.line_h).floor().max(4.0) as u16;
         for p in &self.panes {
-            if let Some(sid) = p.tabs.get(p.active).filter(|t| !is_doc(t) && !self.is_chat(t)) {
+            if let Some(sid) = p.tabs.get(p.active).filter(|t| !is_doc(t) && !is_view(t) && !self.is_chat(t)) {
                 if self.sent_sizes.get(sid) != Some(&(cols, rows)) {
                     self.sent_sizes.insert(sid.clone(), (cols, rows));
                     self.bus.emit("ui.resize", json!({ "session": sid, "cols": cols, "rows": rows }));
@@ -766,7 +814,39 @@ impl Workbench {
             .child({
                 // Views and the plain session list share one scroll area.
                 let mut rows: Vec<gpui::AnyElement> = vec![];
-                for v in &self.views {
+                let open_views: Vec<(String, String)> = self
+                    .views
+                    .iter()
+                    .filter(|v| v.view.dock == "center")
+                    .map(|v| (v.view.id.clone(), v.view.title.clone().unwrap_or_else(|| v.view.id.clone())))
+                    .collect();
+                if !open_views.is_empty() {
+                    rows.push(section_header("VIEWS").into_any_element());
+                    for (i, (id, title)) in open_views.into_iter().enumerate() {
+                        let uri = format!("{VIEW_PREFIX}{id}");
+                        let selected = active_sid.as_deref() == Some(uri.as_str());
+                        rows.push(
+                            div()
+                                .id(("view-entry", i))
+                                .px_3()
+                                .py_1()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .cursor_pointer()
+                                .when(selected, |d| d.bg(rgb(BTN_HOVER)))
+                                .hover(|d| d.bg(rgb(BTN)))
+                                .child(div().text_color(rgb(0x3b8eea)).child("▦"))
+                                .child(title)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.open_tab(&uri);
+                                    cx.notify();
+                                }))
+                                .into_any_element(),
+                        );
+                    }
+                }
+                for v in self.views.iter().filter(|v| v.view.kind == "tree" && v.view.dock == "left") {
                     let title = v.view.title.clone().unwrap_or_else(|| v.view.id.clone()).to_uppercase();
                     rows.push(section_header(&title).into_any_element());
                     if v.root.children.is_empty() {
@@ -1281,6 +1361,259 @@ impl Workbench {
         }
     }
 
+    /// Inline agent picker under a "+" button: starts a session with `facts` in `cwd`.
+    fn agent_picker(&self, key: &str, cwd: Option<String>, facts: Vec<FactInput>, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut row = div().flex().flex_row().flex_wrap().gap_1().items_center().child(div().text_xs().text_color(rgb(DIM)).child("new:"));
+        for (i, a) in self.agents.iter().enumerate() {
+            let agent = a.id.clone();
+            let cwd = cwd.clone();
+            let facts = facts.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("pick-{key}-{i}")))
+                    .px_2()
+                    .rounded_sm()
+                    .text_xs()
+                    .bg(rgb(BTN))
+                    .hover(|s| s.bg(rgb(BTN_HOVER)))
+                    .cursor_pointer()
+                    .child(a.name.clone())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.create_at = None;
+                        this.new_session(agent.clone(), cwd.clone(), facts.clone(), cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        row.into_any_element()
+    }
+
+    fn plus_button(&self, key: String, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let k = key.clone();
+        div()
+            .id(SharedString::from(format!("plus-{key}")))
+            .flex_none()
+            .px_1()
+            .rounded_sm()
+            .text_color(rgb(DIM))
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+            .child("+")
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.create_at = if this.create_at.as_deref() == Some(k.as_str()) { None } else { Some(k.clone()) };
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Set (or clear, for an empty value) a fact as the user, via the tool path.
+    fn set_user_fact(&self, session: String, key: String, value: String, cx: &mut Context<Self>) {
+        let (name, args) = if value.is_empty() {
+            ("fact_clear", json!({ "session": session, "key": key }))
+        } else {
+            ("fact_announce", json!({ "session": session, "key": key, "value": value }))
+        };
+        let req = json!({ "session": "", "name": name, "args": args, "idem": format!("ui-{}", tk_bus::model::now_ms()) });
+        let bus = self.bus.clone();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = bus.request("core", "tool.call", req).await {
+                let _ = this.update(cx, |wb, cx| {
+                    wb.notice(format!("Could not move card: {e}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// The continuation bar (spec §4.3 `chain` views docked on top).
+    fn render_chain_bar(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let v = self.views.iter().find(|v| v.view.dock == "top" && v.view.kind == "chain")?;
+        let chain = v.chain.clone().unwrap_or_default();
+        let ctx = self.context_session();
+        let title = v.view.title.clone().unwrap_or_else(|| v.view.id.clone());
+        let mut bar = div()
+            .id("chain-bar")
+            .h(px(CHAIN_H))
+            .flex_none()
+            .px_3()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_1()
+            .overflow_x_scroll()
+            .bg(rgb(PANEL))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(div().pr_2().text_xs().font_weight(FontWeight::BOLD).text_color(rgb(DIM)).child(title.to_uppercase()));
+        let Some(scope) = chain.scope.clone() else {
+            let key = v.view.scope.clone().unwrap_or_default().trim_start_matches("$selected.").to_string();
+            return Some(bar.child(div().text_xs().text_color(rgb(DIM)).child(format!("Select a session with a `{key}` fact to see its chain."))).into_any_element());
+        };
+        bar = bar.child(div().pr_2().text_xs().text_color(rgb(DIM)).child(format!("{} = {}", scope.key, scope.value)));
+        for (i, step) in chain.steps.iter().enumerate() {
+            if i > 0 {
+                bar = bar.child(div().text_color(rgb(0x555555)).child("›"));
+            }
+            let sid = step.session.clone();
+            let current = ctx.as_deref() == Some(step.session.as_str());
+            let running = self.session(&step.session).map(|s| s.state == "running").unwrap_or(false);
+            let label = step.label.clone().unwrap_or_else(|| "(no phase)".into());
+            bar = bar.child(
+                div()
+                    .id(("chain-step", i))
+                    .px_2()
+                    .py(px(2.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(if current { ACCENT } else { BORDER }))
+                    .bg(rgb(if current { 0x264f78 } else { BTN }))
+                    .text_color(rgb(if running { TEXT } else { DIM }))
+                    .hover(|d| d.bg(rgb(BTN_HOVER)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.open_tab(&sid);
+                        cx.notify();
+                    })),
+            );
+        }
+        // "+ next": a new session continuing the last step, with the chain's scope.
+        let last = chain.steps.last().map(|s| s.session.clone());
+        let key = format!("chain|{}", v.view.id);
+        let mut facts = vec![scope.clone()];
+        if let (Some(last), Some(link)) = (&last, &v.view.link_key) {
+            facts.push(FactInput { key: link.clone(), value: last.clone(), kind: Some("session".into()) });
+        }
+        let cwd = last.as_deref().or(ctx.as_deref()).and_then(|s| self.session(s)).map(|s| s.cwd.clone());
+        bar = bar.child(div().pl_2().text_xs().text_color(rgb(DIM)).child(if last.is_some() { "next" } else { "start" }));
+        bar = bar.child(self.plus_button(key.clone(), cx));
+        if self.create_at.as_deref() == Some(key.as_str()) {
+            bar = bar.child(div().pl_2().child(self.agent_picker(&key, cwd, facts, cx)));
+        }
+        Some(bar.into_any_element())
+    }
+
+    /// A board view (spec §4.3): columns by a fact, cards are sessions, "+" and drag.
+    fn render_board(&self, pi: usize, uri: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let view_id = uri.trim_start_matches(VIEW_PREFIX);
+        let Some(v) = self.views.iter().find(|v| v.view.id == view_id) else {
+            return div().p_4().text_color(rgb(DIM)).child(format!("View '{view_id}' is not configured.")).into_any_element();
+        };
+        let board = v.board.clone().unwrap_or_default();
+        let column_key = v.view.column_key.clone().unwrap_or_default();
+        let ctx = self.context_session();
+        let mut head = div()
+            .flex()
+            .flex_row()
+            .gap_3()
+            .items_center()
+            .pb_3()
+            .child(div().text_size(px(18.0)).font_weight(FontWeight::BOLD).child(v.view.title.clone().unwrap_or_else(|| view_id.to_string())))
+            .child(div().text_xs().text_color(rgb(DIM)).child(format!("columns by `{column_key}`")));
+        for f in &board.filter {
+            head = head.child(div().px_2().rounded_sm().text_xs().bg(rgb(BTN)).child(format!("{} = {}", f.key, f.value)));
+        }
+        for k in &board.unresolved {
+            head = head.child(div().text_xs().text_color(rgb(0xe5c07b)).child(format!("select a session with a `{k}` fact to filter")));
+        }
+        let mut cols = div().flex_1().min_h_0().flex().flex_row().gap_3();
+        for (ci, col) in board.columns.iter().enumerate() {
+            let value = col.value.clone();
+            let label = if value.is_empty() { "(none)".to_string() } else { value.clone() };
+            let key = format!("board|{view_id}|{value}");
+            let mut facts = board.filter.clone();
+            if !value.is_empty() {
+                facts.push(FactInput { key: column_key.clone(), value: value.clone(), kind: None });
+            }
+            let cwd = col.sessions.first().or(ctx.as_ref()).and_then(|s| self.session(s)).map(|s| s.cwd.clone());
+            let drop_value = value.clone();
+            let drop_key = column_key.clone();
+            let mut column = div()
+                .id(("board-col", ci))
+                .flex_1()
+                .min_w(px(200.0))
+                .h_full()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .overflow_y_scroll()
+                .when(v.view.drag, |d| {
+                    d.drag_over::<CardDrag>(|style, _, _, _| style.border_color(rgb(ACCENT)).bg(rgb(0x1f2a36)))
+                        .on_drop(cx.listener(move |this, card: &CardDrag, _, cx| {
+                            this.set_user_fact(card.session.clone(), drop_key.clone(), drop_value.clone(), cx);
+                        }))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .child(div().flex_1().font_weight(FontWeight::BOLD).child(label))
+                        .child(div().text_xs().text_color(rgb(DIM)).child(col.sessions.len().to_string()))
+                        .when(v.view.create, |d| d.child(self.plus_button(key.clone(), cx))),
+                );
+            if self.create_at.as_deref() == Some(key.as_str()) {
+                column = column.child(self.agent_picker(&key, cwd, facts, cx));
+            }
+            for (k, sid) in col.sessions.iter().enumerate() {
+                let Some(s) = self.session(sid) else { continue };
+                let open = sid.clone();
+                let selected = ctx.as_deref() == Some(sid.as_str());
+                let title = self.session_title(sid);
+                let drag = CardDrag { session: sid.clone(), title: title.clone() };
+                let running = s.state == "running";
+                column = column.child(
+                    div()
+                        .id(SharedString::from(format!("card-{pi}-{ci}-{k}")))
+                        .p_2()
+                        .rounded_md()
+                        .bg(rgb(if selected { 0x264f78 } else { TERM_BG }))
+                        .border_1()
+                        .border_color(rgb(if selected { ACCENT } else { BORDER }))
+                        .cursor_pointer()
+                        .hover(|d| d.border_color(rgb(0x555555)))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_2()
+                                .items_center()
+                                .child(div().text_color(rgb(self.kind_color(sid))).child(self.kind_marker(sid)))
+                                .child(div().flex_1().min_w_0().truncate().text_color(rgb(if running { TEXT } else { DIM })).child(title)),
+                        )
+                        .child(div().text_xs().text_color(rgb(DIM)).truncate().child(format!("{} · {}", s.agent, s.cwd)))
+                        .when(v.view.drag, |d| d.on_drag(drag, |card: &CardDrag, _, _, cx| cx.new(|_| card.clone())))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.open_tab(&open);
+                            cx.notify();
+                        })),
+                );
+            }
+            cols = cols.child(column);
+        }
+        div()
+            .flex_1()
+            .min_h_0()
+            .p_4()
+            .flex()
+            .flex_col()
+            .bg(rgb(TERM_BG))
+            .child(head)
+            .child(cols)
+            .into_any_element()
+    }
+
     fn render_doc_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.active_docs.is_empty() {
             return div().px_3().text_color(rgb(DIM)).child("none").into_any_element();
@@ -1445,6 +1778,8 @@ impl Workbench {
         let pane = &self.panes[pi];
         let is_active = pi == self.active_pane;
         let tab_bar = div()
+            .id(SharedString::from(format!("tabbar-{pi}")))
+            .overflow_x_scroll()
             .h(px(TAB_H))
             .flex_none()
             .flex()
@@ -1534,6 +1869,7 @@ impl Workbench {
 
         let content = match pane.tabs.get(pane.active) {
             Some(uri) if is_doc(uri) => self.render_document(pi, uri, cx),
+            Some(uri) if is_view(uri) => self.render_board(pi, uri, cx),
             Some(sid) if self.is_chat(sid) => self.render_chat(pi, sid, cx),
             Some(sid) => self.render_terminal(pi, sid, cx).into_any_element(),
             None => div()
@@ -1611,21 +1947,41 @@ fn section_header(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
-/// The decision log as cards: title, what was decided and why, alternatives, source, time.
+/// The decision log as cards (spec §7.1): title, status, tags, decision, why, alternatives,
+/// context. Project decisions are files in `.tk/decisions/`, so the file name is shown too.
 fn render_decisions(doc: &Document) -> gpui::AnyElement {
     let entries = doc.body["entries"].as_array().cloned().unwrap_or_default();
+    let dir = doc.body["dir"].as_str().unwrap_or("").to_string();
     let mut col = div()
         .flex()
         .flex_col()
         .gap_3()
-        .child(div().text_size(px(18.0)).font_weight(FontWeight::BOLD).child(doc.title.clone()));
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap_3()
+                .items_center()
+                .child(div().text_size(px(18.0)).font_weight(FontWeight::BOLD).child(doc.title.clone()))
+                .child(div().text_xs().text_color(rgb(DIM)).child(dir)),
+        );
     if entries.is_empty() {
-        col = col.child(div().text_color(rgb(DIM)).child("No decisions logged yet. Agents log them with decision_log."));
+        col = col.child(div().text_color(rgb(DIM)).child("No decisions yet. Agents record them with decision_log."));
     }
     for e in entries {
         let s = |k: &str| e[k].as_str().filter(|v| !v.is_empty()).map(String::from);
-        let when = e["at"].as_i64().map(format_time).unwrap_or_default();
-        let source = e["source"].as_str().unwrap_or("").to_string();
+        let superseded = s("status").as_deref() == Some("superseded");
+        let meta = [s("source"), s("date").map(|d| d.replace('T', " ").replace('Z', " UTC")), s("file")]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let mut tags = div().flex().flex_row().flex_wrap().gap_1();
+        if let Some(t) = e["tags"].as_object() {
+            for (k, v) in t {
+                tags = tags.child(div().px_2().rounded_sm().text_xs().bg(rgb(BTN)).child(format!("{k} = {}", v.as_str().unwrap_or(""))));
+            }
+        }
         let mut card = div()
             .p_3()
             .rounded_md()
@@ -1635,14 +1991,29 @@ fn render_decisions(doc: &Document) -> gpui::AnyElement {
             .flex()
             .flex_col()
             .gap_1()
+            .when(superseded, |d| d.opacity(0.55))
             .child(
                 div()
                     .flex()
                     .flex_row()
                     .gap_2()
+                    .items_center()
                     .child(div().flex_1().font_weight(FontWeight::BOLD).child(s("title").unwrap_or_default()))
-                    .child(div().text_xs().text_color(rgb(DIM)).child(format!("{source} · {when}"))),
-            );
+                    .child(
+                        div()
+                            .px_2()
+                            .rounded_sm()
+                            .text_xs()
+                            .bg(rgb(if superseded { 0x4a3a1f } else { 0x1f3a26 }))
+                            .text_color(rgb(if superseded { 0xe5c07b } else { 0x9cdc9c }))
+                            .child(s("status").unwrap_or_else(|| "accepted".into())),
+                    ),
+            )
+            .child(div().text_xs().text_color(rgb(DIM)).child(meta))
+            .child(tags);
+        if let Some(by) = s("superseded_by") {
+            card = card.child(div().text_xs().text_color(rgb(0xe5c07b)).child(format!("superseded by {by}")));
+        }
         for (label, key) in [("Decision", "decision"), ("Why", "rationale"), ("Alternatives", "alternatives"), ("Context", "context")] {
             if let Some(v) = s(key) {
                 card = card.child(
@@ -1658,23 +2029,6 @@ fn render_decisions(doc: &Document) -> gpui::AnyElement {
         col = col.child(card);
     }
     col.into_any_element()
-}
-
-/// `YYYY-MM-DD HH:MM` (UTC) from epoch milliseconds, without a date crate.
-fn format_time(ms: i64) -> String {
-    let secs = ms / 1000;
-    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
-    // Civil-from-days (Howard Hinnant).
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02} UTC", rem / 3600, (rem % 3600) / 60)
 }
 
 impl Render for Workbench {
@@ -1715,7 +2069,16 @@ impl Render for Workbench {
                     .flex()
                     .flex_row()
                     .child(self.render_left(cx))
-                    .child(div().flex_1().min_w_0().h_full().flex().flex_row().children(panes))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .flex()
+                            .flex_col()
+                            .children(self.render_chain_bar(cx))
+                            .child(div().flex_1().min_h_0().flex().flex_row().children(panes)),
+                    )
                     .child(self.render_right(cx)),
             )
             .child(

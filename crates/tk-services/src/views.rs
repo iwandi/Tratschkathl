@@ -1,11 +1,18 @@
-//! View engine (spec §4.3). Views live in `<home>/views.toml`. M1 renders `tree` views:
-//! sessions nested by fact keys. Board and chain views follow in M3.
+//! View engine (spec §4.3). Views live in `<home>/views.toml`:
+//! - `tree`: sessions nested by fact keys
+//! - `board`: columns by the value of one fact (kanban), filtered by facts
+//! - `chain`: sessions linked by a `continues` fact, in order (continuation bar)
+//!
+//! Filters and scopes may say `$selected.<key>`: the value of that fact on the session the
+//! user has selected (the UI sends its facts as `selection`).
 
 use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use tk_bus::model::{Fact, FactInput, RenderedView, SessionInfo, TreeNode, ViewConfig};
+use tk_bus::model::{
+    Board, BoardColumn, Chain, ChainStep, Fact, FactInput, RenderedView, SessionInfo, TreeNode, ViewConfig,
+};
 
 const DEFAULT_VIEWS: &str = r#"# Views (spec §4.3). Agents configure these; you can also edit this file by hand.
 # It is re-read on every change, no restart needed.
@@ -46,10 +53,19 @@ pub fn parse(text: &str) -> Result<Vec<ViewConfig>, String> {
         if !ids.insert(v.id.clone()) {
             return Err(format!("views.toml: duplicate view id '{}'", v.id));
         }
-        if v.kind == "tree" && v.levels.is_empty() {
-            return Err(format!("views.toml: tree view '{}' needs levels", v.id));
+        let fail = |msg: &str| Err(format!("views.toml: view '{}' {msg}", v.id));
+        match v.kind.as_str() {
+            "tree" if v.levels.is_empty() => return fail("(tree) needs levels"),
+            "board" if v.column_key.is_none() || v.columns.is_empty() => return fail("(board) needs column_key and columns"),
+            "chain" if v.link_key.is_none() || v.scope.is_none() => return fail("(chain) needs link_key and scope"),
+            "tree" | "board" | "chain" => {}
+            other => return fail(&format!("has unknown type '{other}' (tree | board | chain)")),
         }
-        for k in &v.levels {
+        if !matches!(v.dock.as_str(), "left" | "center" | "top") {
+            return fail("has an unknown dock (left | center | top)");
+        }
+        let keys = v.levels.iter().chain(v.column_key.iter()).chain(v.link_key.iter()).chain(v.label_key.iter()).chain(v.filter.keys());
+        for k in keys {
             crate::facts::validate_key(k)?;
         }
     }
@@ -131,13 +147,99 @@ fn finish(node: &mut TreeNode, cwd_of: &BTreeMap<&str, (&str, i64)>) -> HashSet<
     all
 }
 
-pub fn render_all(sessions: &[SessionInfo], facts: &[Fact]) -> Result<Vec<RenderedView>, String> {
+/// Resolve `$selected.<key>` against the selection; plain values pass through.
+fn resolve(value: &str, selection: &BTreeMap<String, String>) -> Option<String> {
+    match value.strip_prefix("$selected.") {
+        Some(key) => selection.get(key).cloned(),
+        None => Some(value.to_string()),
+    }
+}
+
+fn has_fact(facts: &[Fact], session: &str, key: &str, value: &str) -> bool {
+    facts.iter().any(|f| f.session == session && f.key == key && f.value == value)
+}
+
+fn fact_value<'a>(facts: &'a [Fact], session: &str, key: &str) -> Option<&'a str> {
+    facts.iter().find(|f| f.session == session && f.key == key).map(|f| f.value.as_str())
+}
+
+pub fn board(view: &ViewConfig, sessions: &[SessionInfo], facts: &[Fact], selection: &BTreeMap<String, String>) -> Board {
+    let mut filter = vec![];
+    let mut unresolved = vec![];
+    for (k, v) in &view.filter {
+        match resolve(v, selection) {
+            Some(value) => filter.push(FactInput { key: k.clone(), value, kind: None }),
+            None => unresolved.push(k.clone()),
+        }
+    }
+    let key = view.column_key.as_deref().unwrap_or("phase");
+    let members: Vec<&SessionInfo> = sessions
+        .iter()
+        .filter(|s| view.show_ended || s.state == "running")
+        .filter(|s| filter.iter().all(|f| has_fact(facts, &s.id, &f.key, &f.value)))
+        .collect();
+    let mut columns: Vec<BoardColumn> = view
+        .columns
+        .iter()
+        .map(|c| BoardColumn {
+            value: c.clone(),
+            sessions: members.iter().filter(|s| has_fact(facts, &s.id, key, c)).map(|s| s.id.clone()).collect(),
+        })
+        .collect();
+    if view.show_unassigned {
+        let rest: Vec<String> = members
+            .iter()
+            .filter(|s| !view.columns.iter().any(|c| has_fact(facts, &s.id, key, c)))
+            .map(|s| s.id.clone())
+            .collect();
+        columns.insert(0, BoardColumn { value: String::new(), sessions: rest });
+    }
+    Board { filter, unresolved, columns }
+}
+
+pub fn chain(view: &ViewConfig, sessions: &[SessionInfo], facts: &[Fact], selection: &BTreeMap<String, String>) -> Chain {
+    let scope = view.scope.as_deref().and_then(|scope| {
+        let key = scope.strip_prefix("$selected.").unwrap_or(scope);
+        resolve(scope, selection).map(|value| FactInput { key: key.to_string(), value, kind: None })
+    });
+    let Some(scope_fact) = &scope else { return Chain { scope: None, steps: vec![] } };
+    let link = view.link_key.as_deref().unwrap_or("continues");
+    let mut members: Vec<&SessionInfo> =
+        sessions.iter().filter(|s| has_fact(facts, &s.id, &scope_fact.key, &scope_fact.value)).collect();
+    members.sort_by_key(|s| s.created_at);
+    let in_set = |id: &str| members.iter().any(|m| m.id == id);
+    let parent = |s: &SessionInfo| fact_value(facts, &s.id, link).filter(|p| in_set(p)).map(String::from);
+    // Depth-first from the roots, children in creation order.
+    let mut steps = vec![];
+    let mut stack: Vec<&SessionInfo> = members.iter().rev().filter(|s| parent(s).is_none()).copied().collect();
+    let mut seen = HashSet::new();
+    while let Some(s) = stack.pop() {
+        if !seen.insert(s.id.clone()) {
+            continue;
+        }
+        steps.push(ChainStep {
+            session: s.id.clone(),
+            label: view.label_key.as_deref().and_then(|k| fact_value(facts, &s.id, k)).map(String::from),
+        });
+        for c in members.iter().rev().filter(|c| parent(c).as_deref() == Some(s.id.as_str())) {
+            stack.push(c);
+        }
+    }
+    Chain { scope, steps }
+}
+
+pub fn render_all(sessions: &[SessionInfo], facts: &[Fact], selection: &BTreeMap<String, String>) -> Result<Vec<RenderedView>, String> {
     Ok(load()?
         .into_iter()
-        .filter(|v| v.kind == "tree")
         .map(|v| {
-            let root = tree(&v, sessions, facts);
-            RenderedView { view: v, root }
+            let mut r = RenderedView { view: v.clone(), root: TreeNode::default(), board: None, chain: None };
+            match v.kind.as_str() {
+                "tree" => r.root = tree(&v, sessions, facts),
+                "board" => r.board = Some(board(&v, sessions, facts, selection)),
+                "chain" => r.chain = Some(chain(&v, sessions, facts, selection)),
+                _ => {}
+            }
+            r
         })
         .collect())
 }
@@ -151,6 +253,41 @@ mod tests {
     }
     fn f(session: &str, k: &str, v: &str) -> Fact {
         Fact { session: session.into(), key: k.into(), value: v.into(), source: "agent".into(), ..Default::default() }
+    }
+
+    fn view(toml_text: &str) -> ViewConfig {
+        parse(toml_text).unwrap().remove(0)
+    }
+
+    #[test]
+    fn board_columns_follow_the_selection() {
+        let v = view("[[view]]\nid='b'\ntype='board'\ndock='center'\ncolumn_key='phase'\ncolumns=['concept','designed']\nfilter={project='$selected.project'}\n");
+        let sessions = vec![s("a", "/x", 1), s("b", "/y", 2), s("c", "/z", 3)];
+        let facts = vec![f("a", "project", "tk"), f("a", "phase", "designed"), f("b", "project", "tk"), f("c", "project", "other")];
+        let sel: BTreeMap<String, String> = [("project".to_string(), "tk".to_string())].into();
+        let b = board(&v, &sessions, &facts, &sel);
+        assert_eq!(b.columns.len(), 3); // unassigned + 2
+        assert_eq!(b.columns[0].sessions, vec!["b"]);
+        assert_eq!(b.columns[2].sessions, vec!["a"]);
+        let none = board(&v, &sessions, &facts, &BTreeMap::new());
+        assert_eq!(none.unresolved, vec!["project"]);
+    }
+
+    #[test]
+    fn chain_follows_continues_links() {
+        let v = view("[[view]]\nid='c'\ntype='chain'\ndock='top'\nlink_key='continues'\nlabel_key='phase'\nscope='$selected.issue'\n");
+        let sessions = vec![s("a", "/x", 1), s("b", "/y", 2), s("c", "/z", 3)];
+        let facts = vec![
+            f("a", "issue", "T-1"), f("a", "phase", "concept"),
+            f("b", "issue", "T-1"), f("b", "phase", "design"), f("b", "continues", "a"),
+            f("c", "issue", "T-1"), f("c", "phase", "implementation"), f("c", "continues", "b"),
+        ];
+        let sel: BTreeMap<String, String> = [("issue".to_string(), "T-1".to_string())].into();
+        let ch = chain(&v, &sessions, &facts, &sel);
+        let order: Vec<_> = ch.steps.iter().map(|s| (s.session.as_str(), s.label.as_deref().unwrap_or(""))).collect();
+        assert_eq!(order, vec![("a", "concept"), ("b", "design"), ("c", "implementation")]);
+        assert!(parse("[[view]]\nid='x'\ntype='board'\n").is_err());
+        assert!(parse("[[view]]\nid='x'\ntype='tree'\nlevels=['a']\ndock='side'\n").is_err());
     }
 
     #[test]

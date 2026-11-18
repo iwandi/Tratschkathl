@@ -86,7 +86,8 @@ fn open_db() -> rusqlite::Result<Connection> {
          );",
     )?;
     db.execute_batch(facts::SCHEMA)?;
-    db.execute_batch(decisions::SCHEMA)?;
+    // Decisions moved to project files (.tk/decisions); drop the old tables.
+    db.execute_batch("DROP TABLE IF EXISTS decisions; DROP TABLE IF EXISTS kv;")?;
     Ok(db)
 }
 
@@ -156,7 +157,9 @@ impl Services {
             "view.render" => {
                 let sessions = self.sessions(None)?;
                 let all = facts::current(&self.db.lock().unwrap(), None, None).map_err(|e| e.to_string())?;
-                Ok(serde_json::to_value(views::render_all(&sessions, &all)?).unwrap())
+                let selection: std::collections::BTreeMap<String, String> =
+                    serde_json::from_value(p["selection"].clone()).unwrap_or_default();
+                Ok(serde_json::to_value(views::render_all(&sessions, &all, &selection)?).unwrap())
             }
             "document.list" => {
                 let session = p["session"].as_str().ok_or("session missing")?;
@@ -178,19 +181,24 @@ impl Services {
     pub fn documents_for(&self, session: &str) -> Result<Vec<DocRef>, String> {
         let current = facts::current(&self.db.lock().unwrap(), Some(session), None).map_err(|e| e.to_string())?;
         let mut out: Vec<DocRef> = vec![];
-        // Built in: the decision log, scoped to the session's issue or project.
-        let scope = current
-            .iter()
-            .find(|f| f.key == "issue")
-            .or_else(|| current.iter().find(|f| f.key == "project"));
-        if let Some(f) = scope {
+        // Built in: the project's decision log (.tk/decisions), and the host's own decisions.
+        if let Some(project) = self.project_root(session) {
+            let name = current.iter().find(|f| f.key == "project").map(|f| f.value.clone()).unwrap_or_else(|| {
+                std::path::Path::new(&project).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+            });
             out.push(DocRef {
-                uri: tk_bus::model::doc_uri("decision-list", "decisions", &format!("{}={}", f.key, f.value)),
+                uri: tk_bus::model::doc_uri("decision-list", "decisions", &project),
                 kind: "decision-list".into(),
-                title: format!("Decisions · {}", f.value),
+                title: format!("Decisions · {name}"),
                 provider: "decisions".into(),
             });
         }
+        out.push(DocRef {
+            uri: tk_bus::model::doc_uri("decision-list", "decisions", "host"),
+            kind: "decision-list".into(),
+            title: "Host decisions".into(),
+            provider: "decisions".into(),
+        });
         for p in &self.plugins {
             if let Some(d) = p.document_provider() {
                 for r in d.list(&current) {
@@ -206,19 +214,18 @@ impl Services {
     pub fn document(&self, uri: &str) -> Result<Document, String> {
         let (kind, provider, reference) = parse_doc_uri(uri).ok_or_else(|| format!("not a document uri: {uri}"))?;
         if provider == "decisions" {
-            // `<key>=<value>` scope, or `source=core` for the host's own decisions.
-            let (k, v) = reference.split_once('=').ok_or("bad decisions scope")?;
-            let db = self.db.lock().unwrap();
-            let entries = if k == "source" {
-                decisions::list(&db, &Default::default(), Some(v), 200)?
+            let (title, entries) = if reference == "host" {
+                ("Host decisions".to_string(), decisions::host(200))
             } else {
-                decisions::list(&db, &[(k.to_string(), v.to_string())].into(), None, 200)?
+                let project = std::path::PathBuf::from(reference);
+                let name = project.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                (format!("Decisions · {name}"), decisions::list(&project, &Default::default(), 500))
             };
             return Ok(Document {
                 uri: uri.to_string(),
                 kind: kind.to_string(),
-                title: if k == "source" { format!("Decisions · {v}") } else { format!("Decisions · {v}") },
-                body: json!({ "scope": { k: v }, "entries": entries }),
+                title,
+                body: json!({ "project": reference, "dir": if reference == "host" { String::new() } else { decisions::dir(std::path::Path::new(reference)).to_string_lossy().into_owned() }, "entries": entries }),
             });
         }
         let plugin = self
@@ -230,6 +237,15 @@ impl Services {
             .document_provider()
             .ok_or_else(|| format!("plugin '{provider}' provides no documents"))?
             .get(kind, reference)
+    }
+
+    /// The project a session works in: its git worktree, or its folder outside git.
+    pub fn project_root(&self, session: &str) -> Option<String> {
+        let current = facts::current(&self.db.lock().unwrap(), Some(session), Some("worktree")).ok()?;
+        if let Some(w) = current.first() {
+            return Some(w.value.clone());
+        }
+        self.sessions(None).ok()?.into_iter().find(|s| s.id == session).map(|s| s.cwd.replace('\\', "/"))
     }
 
     pub fn facts_changed(&self, session: &str) {
@@ -294,12 +310,6 @@ impl Services {
                 self.emit("views.changed", json!({}));
             }
             views_mtime = m;
-
-            // Core's automatic decisions (reloads, rollbacks) join the decision log.
-            let imported = decisions::import_core(&self.db.lock().unwrap());
-            if imported > 0 {
-                self.emit("decisions.changed", json!({ "imported": imported }));
-            }
 
             // Re-derive facts every 10 s: branches change under running sessions.
             if tick % 5 == 0 {

@@ -46,7 +46,7 @@ Every other view, button and command exists because an agent configured it.
 | Terminal           | `portable-pty` (ConPTY on Windows) + `alacritty_terminal` for VT state, rendered with GPUI |
 | Tools for agents   | ACP tools for ACP-hosted agents; MCP (`rmcp`) through a per-session stdio bridge for terminal agents (§4.1) |
 | IPC between layers | Named pipes (Windows) / unix sockets, versioned interfaces             |
-| Storage            | SQLite (WAL): an append-only event log plus projections                |
+| Storage            | Project content as files in the project's `.tk/` folder (committed). Host state in the app's data folder. SQLite only as a cache or for runtime state. |
 | Config             | TOML, schema-validated, hot-reloaded                                   |
 | Primary platform   | Windows; keep macOS and Linux possible                                 |
 
@@ -455,10 +455,24 @@ When a user runs a command, the action runs with `source=User` and is logged lik
 
 ### 7.1 Decision log
 
-- Records decisions with context, alternatives and rationale, linked to a session and its facts.
-- Agents write to it through `decision_log`. The orchestrator writes to it **automatically** whenever it acts on its own:
-  an automation started a session, a resource was granted to A before B, a reload was rolled back, a fact was derived.
-- It is shown as a `decision-list` document, filtered by the current facts ("Design Decisions" for this issue).
+- Decisions belong to the **project**. They live in `<project>/.tk/decisions/`, one Markdown file per decision, and
+  are committed with the code they explain.
+  - Each file has TOML front matter: title, date, status (`accepted` | `superseded`), source, session, `supersedes` /
+    `superseded_by`, and tags taken from the session's facts.
+  - Then come the sections Context, Decision, Alternatives and Why.
+  - One file per decision means parallel sessions and branches never conflict.
+- Agents write decisions through `decision_log` (with `supersedes` when one replaces another) and read them through
+  `decision_list`.
+- The orchestrator's **own** automatic decisions are about the host, not a project: an automation started a session,
+  a resource was granted to A before B, a reload was rolled back. They stay in the app's data folder and are shown as
+  "Host decisions".
+- Both are shown as `decision-list` documents in the context dock.
+
+### 7.1a The `.tk/` project folder
+
+Like `.claude/`, every project can carry a `.tk/` folder that is committed with it. It holds what Tratschkathl knows
+about the project and that people should review: `decisions/` now; project-level views, commands and automation
+rules are candidates for later.
 
 ### 7.2 Automation
 

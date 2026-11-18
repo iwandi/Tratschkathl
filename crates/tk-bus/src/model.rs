@@ -79,6 +79,28 @@ pub struct ViewConfig {
     /// Include ended sessions.
     #[serde(default)]
     pub show_ended: bool,
+    /// Board: the fact whose value picks the column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_key: Option<String>,
+    /// Board: column values in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<String>,
+    /// Board: only sessions with these facts. A value `$selected.<key>` follows the selected
+    /// session (the one the context dock shows).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub filter: std::collections::BTreeMap<String, String>,
+    /// Board: drag cards between columns (re-announces `column_key` as a user fact).
+    #[serde(default)]
+    pub drag: bool,
+    /// Chain: the fact that links a session to the one it continues.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_key: Option<String>,
+    /// Chain: the fact shown as a step's label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_key: Option<String>,
+    /// Chain: which sessions belong to it, e.g. `$selected.issue`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 fn default_dock() -> String {
@@ -108,7 +130,42 @@ pub struct TreeNode {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RenderedView {
     pub view: ViewConfig,
+    #[serde(default)]
     pub root: TreeNode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<Board>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Chain>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Board {
+    /// The filter after resolving `$selected.*`: what "+" in a column also seeds.
+    pub filter: Vec<FactInput>,
+    /// Filter keys that could not be resolved (no selected session with that fact).
+    #[serde(default)]
+    pub unresolved: Vec<String>,
+    pub columns: Vec<BoardColumn>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct BoardColumn {
+    /// Fact value of this column; empty for sessions without one.
+    pub value: String,
+    pub sessions: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Chain {
+    /// The resolved scope fact; `None` when nothing is selected.
+    pub scope: Option<FactInput>,
+    pub steps: Vec<ChainStep>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ChainStep {
+    pub session: String,
+    pub label: Option<String>,
 }
 
 /// A document a provider offers for a session's facts (spec §4.4).
