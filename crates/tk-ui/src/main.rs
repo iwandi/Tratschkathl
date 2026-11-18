@@ -10,7 +10,7 @@ use std::time::Duration;
 use gpui::prelude::*;
 use gpui::{
     div, font, px, rgb, App, Application, Bounds, ClickEvent, Context, FocusHandle, FontWeight, KeyDownEvent,
-    MouseButton, MouseDownEvent, PathPromptOptions, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
+    MouseButton, MouseDownEvent, PathPromptOptions, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions, Window,
     WindowBounds, WindowOptions,
 };
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,9 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use tk_bus::frame::{Frame, KeyInput, Run, BOLD, ITALIC, UNDERLINE};
-use tk_bus::model::{AgentConfig, DocRef, Document, Fact, FactInput, RenderedView, SessionInfo, TreeNode, DOC_PREFIX};
+use tk_bus::model::{
+    AgentConfig, ChatItem, DocRef, Document, Fact, FactInput, RenderedView, SessionInfo, TreeNode, DOC_PREFIX,
+};
 use tk_bus::settings::Settings;
 use tk_bus::{client::handler, Bus};
 
@@ -53,6 +55,9 @@ struct PaneState {
 struct LayoutState {
     panes: Vec<PaneState>,
     active_pane: usize,
+    /// Unsent chat drafts by session.
+    #[serde(default)]
+    drafts: HashMap<String, String>,
 }
 
 struct Pane {
@@ -100,6 +105,12 @@ struct Workbench {
     doc_inflight: HashSet<String>,
     /// Collapsed files in changeset documents, by `uri#path`.
     collapsed_files: HashSet<String>,
+    /// Chat transcripts by session, with the agent state.
+    chats: HashMap<String, (Vec<ChatItem>, String)>,
+    chat_scroll: HashMap<String, ScrollHandle>,
+    /// Unsent chat input by session.
+    drafts: HashMap<String, String>,
+    chat_requested: HashSet<String>,
 }
 
 fn is_doc(id: &str) -> bool {
@@ -143,6 +154,7 @@ fn main() {
                 "workbench.".into(),
                 "facts.".into(),
                 "views.".into(),
+                "chat.".into(),
             ],
             Some(h),
         )
@@ -303,6 +315,10 @@ impl Workbench {
             doc_errors: HashMap::new(),
             doc_inflight: HashSet::new(),
             collapsed_files: HashSet::new(),
+            chats: HashMap::new(),
+            chat_scroll: HashMap::new(),
+            drafts: HashMap::new(),
+            chat_requested: HashSet::new(),
         }
     }
 
@@ -319,6 +335,7 @@ impl Workbench {
         LayoutState {
             panes: self.panes.iter().map(|p| PaneState { tabs: p.tabs.clone(), active: p.active }).collect(),
             active_pane: self.active_pane,
+            drafts: self.drafts.clone(),
         }
     }
 
@@ -332,6 +349,7 @@ impl Workbench {
             .map(|p| Pane { active: p.active.min(p.tabs.len().saturating_sub(1)), tabs: p.tabs, focus: cx.focus_handle() })
             .collect();
         self.active_pane = layout.active_pane.min(self.panes.len() - 1);
+        self.drafts = layout.drafts;
         self.want_focus = true;
     }
 
@@ -443,6 +461,7 @@ impl Workbench {
                 }
             }
             "views.changed" => self.refresh_views(cx),
+            "chat.items" => self.apply_chat(&data),
             "workbench.open_document" => {
                 if let Some(uri) = data["uri"].as_str() {
                     if data["placement"].as_str() == Some("split") {
@@ -657,7 +676,7 @@ impl Workbench {
         let cols = (pane_w / self.cell_w).floor().max(10.0) as u16;
         let rows = (pane_h / self.line_h).floor().max(4.0) as u16;
         for p in &self.panes {
-            if let Some(sid) = p.tabs.get(p.active).filter(|t| !is_doc(t)) {
+            if let Some(sid) = p.tabs.get(p.active).filter(|t| !is_doc(t) && !self.is_chat(t)) {
                 if self.sent_sizes.get(sid) != Some(&(cols, rows)) {
                     self.sent_sizes.insert(sid.clone(), (cols, rows));
                     self.bus.emit("ui.resize", json!({ "session": sid, "cols": cols, "rows": rows }));
@@ -928,6 +947,291 @@ impl Workbench {
             .into_any_element()
     }
 
+    fn is_chat(&self, id: &str) -> bool {
+        self.session(id).is_some_and(|s| s.kind == "chat")
+    }
+
+    fn apply_chat(&mut self, data: &Value) {
+        let Some(sid) = data["session"].as_str() else { return };
+        let from = data["from"].as_u64().unwrap_or(0) as usize;
+        let items: Vec<ChatItem> = serde_json::from_value(data["items"].clone()).unwrap_or_default();
+        let state = data["state"].as_str().unwrap_or("").to_string();
+        let entry = self.chats.entry(sid.to_string()).or_insert_with(|| (vec![], String::new()));
+        let grew = from + items.len() >= entry.0.len();
+        entry.0.truncate(from);
+        entry.0.extend(items);
+        entry.1 = state;
+        if grew {
+            if let Some(h) = self.chat_scroll.get(sid) {
+                h.scroll_to_bottom();
+            }
+        }
+    }
+
+    /// Load the transcript of a chat tab that has none yet (UI start, ended sessions).
+    fn ensure_chat(&mut self, sid: &str, cx: &mut Context<Self>) {
+        if self.chats.contains_key(sid) || !self.chat_requested.insert(sid.to_string()) {
+            return;
+        }
+        let bus = self.bus.clone();
+        let sid = sid.to_string();
+        cx.spawn(async move |this, cx| {
+            if let Ok(v) = bus.request("agents", "chat.history", json!({ "session": sid })).await {
+                let _ = this.update(cx, |wb, cx| {
+                    if !wb.chats.contains_key(&sid) {
+                        wb.apply_chat(&v);
+                        cx.notify();
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn chat_call(&self, method: &str, params: Value, cx: &mut Context<Self>) {
+        let bus = self.bus.clone();
+        let method = method.to_string();
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = bus.request("agents", &method, params).await {
+                let _ = this.update(cx, |wb, cx| {
+                    wb.notice(format!("Chat: {e}"));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn on_chat_key(&mut self, sid: &str, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let m = &ks.modifiers;
+        let draft = self.drafts.entry(sid.to_string()).or_default();
+        match ks.key.as_str() {
+            "enter" if !m.shift => {
+                let text = draft.trim().to_string();
+                if !text.is_empty() {
+                    draft.clear();
+                    self.chat_call("chat.send", json!({ "session": sid, "text": text }), cx);
+                }
+            }
+            "enter" => draft.push('\n'),
+            "backspace" => {
+                if m.control {
+                    let keep = draft.trim_end().rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
+                    draft.truncate(keep);
+                } else {
+                    draft.pop();
+                }
+            }
+            "escape" => self.chat_call("chat.cancel", json!({ "session": sid }), cx),
+            "space" => draft.push(' '),
+            "tab" => draft.push_str("    "),
+            "v" if m.control && !m.alt => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|c| c.text()) {
+                    draft.push_str(&text.replace("\r\n", "\n"));
+                }
+            }
+            _ => {
+                if let Some(c) = &ks.key_char {
+                    if !(m.control && !m.alt) {
+                        draft.push_str(c);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_chat(&self, pi: usize, sid: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (items, state) = self.chats.get(sid).map(|(i, s)| (i.as_slice(), s.as_str())).unwrap_or((&[], "loading"));
+        let scroll = self.chat_scroll.get(sid).cloned().unwrap_or_default();
+        let focus = self.panes[pi].focus.clone();
+        let focus2 = focus.clone();
+        let sid_key = sid.to_string();
+        let mono = self.font_family.clone();
+        let mut list = div()
+            .id(SharedString::from(format!("chat-{pi}")))
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .track_scroll(&scroll)
+            .p_4()
+            .flex()
+            .flex_col()
+            .gap_3();
+        for (ix, item) in items.iter().enumerate() {
+            list = list.child(self.render_chat_item(sid, ix, item, mono.clone(), cx));
+        }
+        let draft = self.drafts.get(sid).cloned().unwrap_or_default();
+        let focused = self.active_pane == pi;
+        let (state_text, state_color) = match state {
+            "starting" => ("Starting the agent…", 0xe5e510),
+            "working" => ("Agent is working… (Esc to cancel)", 0x3b8eea),
+            "waiting" => ("Waiting for your permission", 0xe5c07b),
+            "idle" => ("Ready", 0x23d18b),
+            "error" => ("Error", 0xf14c4c),
+            "ended" => ("Agent process ended", 0x888888),
+            other => (other, 0x888888),
+        };
+        let input = div()
+            .id(SharedString::from(format!("chat-input-{pi}")))
+            .track_focus(&focus)
+            .mx_4()
+            .mb_3()
+            .p_2()
+            .min_h(px(44.0))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if focused { ACCENT } else { BORDER }))
+            .bg(rgb(PANEL))
+            .cursor_text()
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+                cx.stop_propagation();
+                this.on_chat_key(&sid_key, ev, cx);
+            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                    this.active_pane = pi;
+                    window.focus(&focus2);
+                    cx.notify();
+                }),
+            )
+            .child(if draft.is_empty() {
+                div()
+                    .text_color(rgb(DIM))
+                    .child("Message the agent. Enter sends, Shift+Enter adds a line, Esc cancels the turn.")
+                    .into_any_element()
+            } else {
+                div()
+                    .flex()
+                    .flex_col()
+                    .children(draft.split('\n').map(|l| div().min_h(px(18.0)).child(l.to_string())).collect::<Vec<_>>())
+                    .into_any_element()
+            })
+            .when(focused, |d| d.child(div().w(px(8.0)).h(px(2.0)).bg(rgb(TEXT))));
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .bg(rgb(TERM_BG))
+            .child(list)
+            .child(div().px_4().pb_1().text_xs().text_color(rgb(state_color)).child(state_text.to_string()))
+            .child(input)
+            .into_any_element()
+    }
+
+    fn render_chat_item(&self, sid: &str, ix: usize, item: &ChatItem, mono: SharedString, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let card = |border: u32| div().p_3().rounded_md().border_1().border_color(rgb(border)).bg(rgb(PANEL)).flex().flex_col().gap_1();
+        let limited = |text: &str, n: usize| -> String {
+            let lines: Vec<&str> = text.lines().collect();
+            if lines.len() > n {
+                format!("{}\n… {} more lines", lines[..n].join("\n"), lines.len() - n)
+            } else {
+                text.to_string()
+            }
+        };
+        match item.kind.as_str() {
+            "user" => div()
+                .flex()
+                .flex_row()
+                .child(div().flex_1())
+                .child(div().max_w(px(640.0)).p_3().rounded_md().bg(rgb(0x264f78)).child(item.text.clone()))
+                .into_any_element(),
+            "agent" => markdown::render(&item.text, mono),
+            "thought" => div()
+                .pl_3()
+                .border_l_2()
+                .border_color(rgb(0x444444))
+                .text_color(rgb(DIM))
+                .italic()
+                .child(limited(&item.text, 4))
+                .into_any_element(),
+            "tool" => {
+                let status = item.status.clone().unwrap_or_default();
+                let (icon, color) = match status.as_str() {
+                    "completed" => ("●", 0x23d18b),
+                    "failed" => ("✕", 0xf14c4c),
+                    "in_progress" => ("◐", 0x3b8eea),
+                    _ => ("○", 0x888888),
+                };
+                card(BORDER)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(div().text_color(rgb(color)).child(icon))
+                            .child(div().flex_1().min_w_0().truncate().child(item.title.clone().unwrap_or_else(|| "Tool".into())))
+                            .child(div().text_xs().text_color(rgb(DIM)).child(status)),
+                    )
+                    .when(!item.text.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .font_family(mono.clone())
+                                .text_size(px(12.0))
+                                .text_color(rgb(0xb0b0b0))
+                                .flex()
+                                .flex_col()
+                                .children(limited(&item.text, 14).lines().map(|l| {
+                                    let color = if l.starts_with('+') {
+                                        0x9cdc9c
+                                    } else if l.starts_with('-') {
+                                        0xf48771
+                                    } else {
+                                        0xb0b0b0
+                                    };
+                                    div().whitespace_nowrap().overflow_hidden().text_color(rgb(color)).child(l.to_string())
+                                }).collect::<Vec<_>>()),
+                        )
+                    })
+                    .into_any_element()
+            }
+            "plan" => card(BORDER)
+                .child(div().font_weight(FontWeight::BOLD).child("Plan"))
+                .children(item.text.lines().map(|l| div().child(l.to_string())).collect::<Vec<_>>())
+                .into_any_element(),
+            "permission" => {
+                let mut c = card(0xe5c07b)
+                    .child(div().font_weight(FontWeight::BOLD).child(item.title.clone().unwrap_or_else(|| "Permission requested".into())));
+                if !item.text.is_empty() {
+                    c = c.child(div().font_family(mono.clone()).text_size(px(12.0)).text_color(rgb(DIM)).child(limited(&item.text, 10)));
+                }
+                match &item.chosen {
+                    Some(choice) => {
+                        let name = item.options.iter().find(|o| &o.id == choice).map(|o| o.name.clone()).unwrap_or(choice.clone());
+                        c.child(div().text_color(rgb(DIM)).child(format!("→ {name}"))).into_any_element()
+                    }
+                    None => {
+                        let mut row = div().flex().flex_row().gap_2().pt_1();
+                        for (oi, o) in item.options.iter().enumerate() {
+                            let allow = o.kind.starts_with("allow");
+                            let params = json!({ "session": sid, "request": item.id, "option": o.id });
+                            row = row.child(
+                                div()
+                                    .id(SharedString::from(format!("perm-{ix}-{oi}")))
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(if allow { 0x1f5f3a } else { BTN }))
+                                    .hover(|d| d.bg(rgb(if allow { 0x267a4a } else { BTN_HOVER })))
+                                    .child(o.name.clone())
+                                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.chat_call("chat.permission", params.clone(), cx);
+                                    })),
+                            );
+                        }
+                        c.child(row).into_any_element()
+                    }
+                }
+            }
+            "error" => div().text_color(rgb(0xf48771)).child(item.text.clone()).into_any_element(),
+            _ => div().text_xs().text_color(rgb(DIM)).child(item.text.clone()).into_any_element(),
+        }
+    }
+
     fn render_doc_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self.active_docs.is_empty() {
             return div().px_3().text_color(rgb(DIM)).child("none").into_any_element();
@@ -1158,6 +1462,7 @@ impl Workbench {
 
         let content = match pane.tabs.get(pane.active) {
             Some(uri) if is_doc(uri) => self.render_document(pi, uri, cx),
+            Some(sid) if self.is_chat(sid) => self.render_chat(pi, sid, cx),
             Some(sid) => self.render_terminal(pi, sid, cx).into_any_element(),
             None => div()
                 .flex_1()
@@ -1264,6 +1569,12 @@ impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_sizes(window);
         self.sync_active_facts(cx);
+        let chat_tabs: Vec<String> =
+            self.panes.iter().filter_map(|p| p.tabs.get(p.active)).filter(|t| self.is_chat(t)).cloned().collect();
+        for sid in chat_tabs {
+            self.chat_scroll.entry(sid.clone()).or_default();
+            self.ensure_chat(&sid, cx);
+        }
         for uri in self.visible_docs() {
             if !self.docs.contains_key(&uri) && !self.doc_errors.contains_key(&uri) {
                 self.fetch_doc(uri, cx);

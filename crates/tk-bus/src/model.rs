@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct SessionInfo {
     pub id: String,
-    /// `terminal` for M0; `chat` arrives with ACP.
+    /// `terminal` (PTY) or `chat` (ACP).
     pub kind: String,
     pub agent: String,
     pub title: String,
@@ -23,6 +23,13 @@ pub struct AgentConfig {
     /// Pass the orchestrator tools via `--mcp-config` (Claude Code).
     #[serde(default)]
     pub mcp: bool,
+    /// `terminal` (TUI in a PTY, the default) or `acp` (chat over the Agent Client Protocol).
+    #[serde(default = "default_agent_kind")]
+    pub kind: String,
+}
+
+fn default_agent_kind() -> String {
+    "terminal".into()
 }
 
 /// A current fact about a session (spec §4.2). `kind` is set for `Ref` values
@@ -123,6 +130,35 @@ pub struct Document {
     pub kind: String,
     pub title: String,
     pub body: serde_json::Value,
+}
+
+/// One entry of a chat (ACP) session's transcript, as shown by the UI.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ChatItem {
+    pub id: String,
+    /// `user` | `agent` | `thought` | `tool` | `plan` | `permission` | `error` | `info`
+    pub kind: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Tool: `pending` | `in_progress` | `completed` | `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Permission choices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ChatOption>,
+    /// The permission choice that was made (option id, or `cancelled`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chosen: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct ChatOption {
+    pub id: String,
+    pub name: String,
+    /// `allow_once` | `allow_always` | `reject_once` | `reject_always`
+    pub kind: String,
 }
 
 pub const DOC_PREFIX: &str = "tk://doc/";

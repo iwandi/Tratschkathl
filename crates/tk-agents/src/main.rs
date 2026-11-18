@@ -1,6 +1,9 @@
-//! L3 Agent Handler: session lifecycle (start, attach, kill) and terminal emulation. Agents run
-//! under `tk-shim`, so this layer can reload at any time: it re-attaches to every shim and
-//! rebuilds the terminal state by replaying the shim's ring buffer.
+//! L3 Agent Handler: session lifecycle (start, attach, kill), terminal emulation, and the ACP
+//! client for chat sessions. Agents run under `tk-shim`, so this layer can reload at any time:
+//! it re-attaches to every shim and rebuilds terminal state (ring buffer replay) or the chat
+//! transcript (full ACP log replay).
+
+mod acp;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,6 +28,8 @@ use tk_term::TermModel;
 struct Sess {
     info: SessionInfo,
     model: TermModel,
+    /// Chat (ACP) sessions only.
+    chat: Option<acp::Chat>,
     shim_tx: Option<mpsc::UnboundedSender<String>>,
     dirty: bool,
     replaying: bool,
@@ -159,9 +164,45 @@ impl Agents {
             }
             "term.refresh" => {
                 for s in self.sessions.lock().unwrap().values() {
-                    s.lock().unwrap().dirty = true;
+                    let mut s = s.lock().unwrap();
+                    s.dirty = true;
+                    if let Some(c) = &mut s.chat {
+                        c.dirty_from = Some(0);
+                    }
                 }
                 Ok(json!(true))
+            }
+            "chat.send" | "chat.cancel" | "chat.permission" => {
+                let id = p["session"].as_str().ok_or("session missing")?;
+                let sess = self.get(id).ok_or("session is not running")?;
+                let mut s = sess.lock().unwrap();
+                let tx = s.shim_tx.clone().ok_or("session not attached yet")?;
+                let chat = s.chat.as_mut().ok_or("not a chat session")?;
+                let out = match inc.method.as_str() {
+                    "chat.send" => chat.prompt(p["text"].as_str().unwrap_or(""))?,
+                    "chat.cancel" => chat.cancel(),
+                    _ => chat.choose(p["request"].as_str().ok_or("request missing")?, p["option"].as_str()),
+                };
+                for l in out {
+                    let _ = tx.send(json!({ "t": "send", "line": l }).to_string() + "\n");
+                }
+                Ok(json!({ "state": chat.state }))
+            }
+            "chat.history" => {
+                // Transcript of a session that is no longer running, rebuilt from its ACP log.
+                let id = p["session"].as_str().ok_or("session missing")?;
+                if let Some(sess) = self.get(id) {
+                    if let Some(c) = &sess.lock().unwrap().chat {
+                        return Ok(json!({ "session": id, "from": 0, "items": c.items, "state": c.state }));
+                    }
+                }
+                let text = std::fs::read_to_string(paths::sessions_dir().join(id).join("acp.jsonl")).map_err(|e| e.to_string())?;
+                let mut chat = acp::Chat::new(id, "", None);
+                for l in text.lines() {
+                    let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
+                    chat.on_line(v["dir"].as_str().unwrap_or(""), v["line"].as_str().unwrap_or(""), false);
+                }
+                Ok(json!({ "session": id, "from": 0, "items": chat.items, "state": "ended" }))
             }
             other => Err(format!("agents: unknown method {other}")),
         }
@@ -215,6 +256,19 @@ impl Agents {
         let sessions: Vec<_> = self.sessions.lock().unwrap().values().cloned().collect();
         for sess in sessions {
             let mut s = sess.lock().unwrap();
+            if !s.replaying {
+                let id = s.info.id.clone();
+                if let Some(c) = &mut s.chat {
+                    if let Some(from) = c.dirty_from.take() {
+                        let from = from.min(c.items.len());
+                        self.bus().emit(
+                            "chat.items",
+                            json!({ "session": id, "from": from, "items": &c.items[from..], "state": c.state }),
+                        );
+                    }
+                    continue;
+                }
+            }
             if s.dirty && !s.replaying {
                 s.dirty = false;
                 let frame = s.model.frame();
@@ -251,7 +305,8 @@ impl Agents {
 
         let vs = VersionState::load();
         let shim = vs.exe("helpers", "tk-shim", false).ok_or("helpers not installed")?;
-        if agent.mcp {
+        let is_chat = agent.kind == "acp";
+        if agent.mcp && !is_chat {
             let bridge = vs.exe("helpers", "tk-mcp-bridge", false).ok_or("helpers not installed")?;
             let dir = paths::sessions_dir().join(&id);
             std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -268,7 +323,8 @@ impl Agents {
         }
 
         let mut cmd = std::process::Command::new(&shim);
-        cmd.args(["--session", &id, "--cwd", cwd, "--cols", &cols.to_string(), "--rows", &rows.to_string(), "--"])
+        cmd.args(["--session", &id, "--cwd", cwd, "--mode", if is_chat { "stdio" } else { "pty" }])
+            .args(["--cols", &cols.to_string(), "--rows", &rows.to_string(), "--"])
             .arg(&prog)
             .args(&args)
             .env("TK_HOME", paths::home());
@@ -278,7 +334,7 @@ impl Agents {
 
         let info = SessionInfo {
             id: id.clone(),
-            kind: "terminal".into(),
+            kind: if is_chat { "chat".into() } else { "terminal".into() },
             agent: agent.id.clone(),
             title: agent.name.clone(),
             cwd: cwd.to_string(),
@@ -294,8 +350,13 @@ impl Agents {
 
     fn add_session(self: &Arc<Self>, info: SessionInfo, cols: u16, rows: u16) {
         let id = info.id.clone();
+        let chat = (info.kind == "chat").then(|| {
+            let bridge = VersionState::load().exe("helpers", "tk-mcp-bridge", false);
+            acp::Chat::new(&info.id, &info.cwd, bridge)
+        });
         let sess = Arc::new(Mutex::new(Sess {
             info,
+            chat,
             model: TermModel::new(cols, rows),
             shim_tx: None,
             dirty: true,
@@ -368,12 +429,35 @@ impl Agents {
                     }
                     s.dirty = true;
                 }
+                Some("line") => {
+                    let live = !s.replaying;
+                    if let Some(chat) = &mut s.chat {
+                        let out = chat.on_line(msg["dir"].as_str().unwrap_or(""), msg["line"].as_str().unwrap_or(""), live);
+                        for l in out {
+                            let _ = tx.send(json!({ "t": "send", "line": l }).to_string() + "\n");
+                        }
+                    }
+                }
                 Some("replay_end") => {
                     s.replaying = false;
                     s.dirty = true;
+                    if let Some(chat) = &mut s.chat {
+                        for l in chat.after_replay() {
+                            let _ = tx.send(json!({ "t": "send", "line": l }).to_string() + "\n");
+                        }
+                    }
                 }
                 Some("exit") => {
                     tracing::info!("session {id}: agent exited ({})", msg["code"]);
+                    let sid = s.info.id.clone();
+                    if let Some(chat) = &mut s.chat {
+                        chat.ended(msg["code"].as_i64().unwrap_or(-1));
+                        let from = chat.dirty_from.take().unwrap_or(0).min(chat.items.len());
+                        self.bus().emit(
+                            "chat.items",
+                            json!({ "session": sid, "from": from, "items": &chat.items[from..], "state": chat.state }),
+                        );
+                    }
                     result = Ok(());
                     break;
                 }

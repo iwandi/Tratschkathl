@@ -2,13 +2,17 @@
 //! the output in a ring buffer and serves it from any offset over a local socket, so every
 //! layer (Core included) can restart without killing the agent.
 //!
-//! Usage: `tk-shim --session <id> --cwd <dir> [--cols N --rows N] -- <command> [args...]`
+//! Usage: `tk-shim --session <id> --cwd <dir> [--mode pty|stdio] [--cols N --rows N] -- <command> [args...]`
+//!
+//! `pty` (default) hosts a TUI agent; `stdio` hosts an ACP agent (see `stdio.rs`).
 //!
 //! Socket protocol (JSON lines), client → shim:
 //!   {"t":"attach","from":0}  {"t":"input","b64":"..."}  {"t":"resize","cols":..,"rows":..}  {"t":"kill"}
 //! shim → client:
 //!   {"t":"hello","fresh":bool,"start":N,"cols":N,"rows":N}  {"t":"output","offset":N,"b64":"..."}  {"t":"replay_end"}
 //!   {"t":"exit","code":N}
+
+mod stdio;
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -50,7 +54,8 @@ fn b64(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-struct Args {
+pub struct Args {
+    mode: String,
     session: String,
     cwd: String,
     cols: u16,
@@ -59,7 +64,7 @@ struct Args {
 }
 
 fn parse_args() -> Result<Args> {
-    let mut a = Args { session: String::new(), cwd: ".".into(), cols: 120, rows: 36, cmd: vec![] };
+    let mut a = Args { mode: "pty".into(), session: String::new(), cwd: ".".into(), cols: 120, rows: 36, cmd: vec![] };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -68,6 +73,7 @@ fn parse_args() -> Result<Args> {
                 std::process::exit(0);
             }
             "--session" => a.session = it.next().context("--session value")?,
+            "--mode" => a.mode = it.next().context("--mode value")?,
             "--cwd" => a.cwd = it.next().context("--cwd value")?,
             "--cols" => a.cols = it.next().context("--cols value")?.parse()?,
             "--rows" => a.rows = it.next().context("--rows value")?.parse()?,
@@ -85,7 +91,10 @@ fn parse_args() -> Result<Args> {
 async fn main() -> Result<()> {
     let args = parse_args()?;
     tk_bus::logging::init(&format!("shim-{}", args.session));
-    tracing::info!("shim {} starting: {:?} in {}", args.session, args.cmd, args.cwd);
+    tracing::info!("shim {} starting ({}): {:?} in {}", args.session, args.mode, args.cmd, args.cwd);
+    if args.mode == "stdio" {
+        return stdio::run(args).await;
+    }
 
     let pty = native_pty_system()
         .openpty(PtySize { rows: args.rows, cols: args.cols, pixel_width: 0, pixel_height: 0 })

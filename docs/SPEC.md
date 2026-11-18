@@ -587,6 +587,8 @@ docs/
 8. **Helper upgrades**: how do running sessions move to a new `tk-shim` / `tk-mcp-bridge` version? Only new sessions,
    or an opt-in "migrate session" that uses resume?
 9. **ACP tool delivery**: which mechanism does the Claude ACP adapter support today for client-provided tools
-   (MCP-over-ACP, extension methods, or only `mcpServers`)? Check before M2; the bridge fallback covers the gap.
+   (MCP-over-ACP, extension methods, or only `mcpServers`)? *M2 status:* the tools reach chat agents through the
+   `tk-mcp-bridge` declared in `session/new { mcpServers }`. The client serves `fs/*`. It does not offer `terminal/*`
+   yet, so the agent runs commands itself.
 10. **Global search**: deliberately left out for now and needs more thought. What would it search (sessions, transcripts,
     facts, documents, decisions, plugin sources), and how would it relate to agents?

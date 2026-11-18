@@ -4,19 +4,21 @@ A desktop orchestrator for LLM agent sessions, built in Rust with GPUI. It devel
 the agents that work on Tratschkathl run inside Tratschkathl, and the app reloads itself
 layer by layer while their sessions keep running. See [docs/SPEC.md](docs/SPEC.md).
 
-## Status: M1 (facts and the tree view)
+## Status: M2 (chat sessions and documents)
 
-M0 (bootstrap) and M1 are done.
+M0 (bootstrap), M1 (facts and the tree view) and M2 are done.
 
 - `tk-launcher`: stages builds into versioned folders, starts Core, reboots it and rolls it back.
 - `tk-core` (L1): bus hub, layer supervisor, `host_reload` / `host_rollback`, handoff store.
 - `tk-services` (L2): session registry, fact store, view engine, tool registry, and the plugin host.
-- `tk-agents` (L3): session lifecycle and terminal emulation (alacritty_terminal).
-- `tk-ui` (L4): the GPUI workbench. It has the configured views and a session list on the left,
-  tabbed and split panes, terminal tabs, and a context dock that shows the active session's facts.
+- `tk-agents` (L3): session lifecycle, terminal emulation (alacritty_terminal), and the ACP client for chat sessions.
+- `tk-ui` (L4): the GPUI workbench. It has the configured views and a session list on the left;
+  tabbed and split panes with terminal, chat and document tabs; and a context dock with the
+  session's facts and documents.
 - `tk-plugin-api`: capability traits. `plugins/tk-plugin-git` derives `project`, `repo`, `branch`
   and `worktree` facts from each session's folder.
-- `tk-shim`: one per session. It owns the PTY, so every layer can restart without killing the agent.
+- `tk-shim`: one per session. It owns the PTY (terminal agents) or the stdio pipes and full log
+  (ACP agents), so every layer can restart without killing the agent.
 - `tk-mcp-bridge`: the stdio MCP server that Claude Code starts. It holds tool calls while layers reload.
 - `tk-ctl`: a small debugging client for the bus.
 
@@ -39,8 +41,28 @@ Agents are configured in `%LOCALAPPDATA%\Tratschkathl\settings.toml`. The defaul
 `tratschkathl` MCP server with these tools:
 
 - facts: `fact_announce`, `fact_clear`, `fact_list`, `fact_query`
+- documents: `document_list`, `document_open`
 - sessions: `session_list`, `session_focus`
 - host: `host_status`, `host_reload`, `host_rollback`
+
+## Chat sessions (ACP)
+
+"Claude (chat)" runs the Claude ACP adapter (`npx -y @agentclientprotocol/claude-agent-acp`). It needs
+Node.js and a Claude login. The chat shows streamed answers as Markdown, thoughts, tool calls with
+diffs, the agent's plan, and permission requests with buttons. Tratschkathl serves the agent's
+file reads and writes, and the orchestrator tools reach the agent through the MCP bridge.
+
+`tools/mock_acp_agent.py` is a scripted ACP agent for testing without an LLM. The comment at the
+top of the file shows its `settings.toml` entry.
+
+## Documents
+
+The context dock lists documents for the session's facts:
+
+- the worktree's uncommitted changes (`changeset`, from the Git plugin)
+- its Markdown files (root and `docs/`, plus any `doc` facts)
+
+Open documents refresh by themselves while they are visible.
 
 ## Facts and views
 
