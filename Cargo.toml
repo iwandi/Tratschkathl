@@ -28,6 +28,7 @@ which = "7"
 portable-pty = "0.9"
 alacritty_terminal = "0.26"
 gpui = "0.2.2"
+unicode-width = "0.2.3"
 pulldown-cmark = { version = "0.13", default-features = false }
 rusqlite = { version = "0.32", features = ["bundled"] }
 

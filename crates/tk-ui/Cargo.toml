@@ -14,3 +14,4 @@ tokio.workspace = true
 tracing.workspace = true
 gpui.workspace = true
 pulldown-cmark.workspace = true
+unicode-width.workspace = true

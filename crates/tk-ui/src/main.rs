@@ -3,6 +3,7 @@
 //! to the next UI version on reload.
 
 mod markdown;
+mod termdraw;
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
-use tk_bus::frame::{Frame, KeyInput, Run, BOLD, ITALIC, UNDERLINE};
+use tk_bus::frame::{Frame, KeyInput};
 use tk_bus::model::{
     AgentConfig, ChatItem, DocRef, Document, Fact, FactInput, RenderedView, SessionInfo, TreeNode, DOC_PREFIX,
 };
@@ -1552,7 +1553,7 @@ impl Workbench {
         let line_h = self.line_h;
         let ended = self.session(sid).map(|s| s.state != "running").unwrap_or(false);
         let lines: Vec<gpui::AnyElement> = match self.frames.get(sid) {
-            Some(frame) => frame.lines.iter().map(|l| render_line(l, cell_w, line_h).into_any_element()).collect(),
+            Some(frame) => frame.lines.iter().map(|l| termdraw::render_line(l, cell_w, line_h, TERM_BG)).collect(),
             None => vec![div().text_color(rgb(DIM)).child("connecting…").into_any_element()],
         };
         div()
@@ -1594,32 +1595,6 @@ fn section_header(text: &str) -> impl IntoElement {
         .font_weight(FontWeight::BOLD)
         .text_color(rgb(DIM))
         .child(text.to_string())
-}
-
-fn render_line(line: &[Run], cell_w: f32, line_h: f32) -> impl IntoElement {
-    div().h(px(line_h)).flex().flex_row().whitespace_nowrap().children(line.iter().map(move |r| {
-        let cells = if r.cells > 0 { r.cells as f32 } else { r.text.chars().count() as f32 };
-        let mut d = div()
-            .flex_none()
-            .w(px(cells * cell_w))
-            .h(px(line_h))
-            .overflow_hidden()
-            .text_color(rgb(r.fg))
-            .child(r.text.clone());
-        if r.bg != TERM_BG {
-            d = d.bg(rgb(r.bg));
-        }
-        if r.flags & BOLD != 0 {
-            d = d.font_weight(FontWeight::BOLD);
-        }
-        if r.flags & ITALIC != 0 {
-            d = d.italic();
-        }
-        if r.flags & UNDERLINE != 0 {
-            d = d.underline();
-        }
-        d
-    }))
 }
 
 impl Render for Workbench {

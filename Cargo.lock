@@ -5837,6 +5837,7 @@ dependencies = [
  "tk-bus",
  "tokio",
  "tracing",
+ "unicode-width",
 ]
 
 [[package]]
