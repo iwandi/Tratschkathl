@@ -46,7 +46,7 @@ Every other view, button and command exists because an agent configured it.
 | Terminal           | `portable-pty` (ConPTY on Windows) + `alacritty_terminal` for VT state, rendered with GPUI |
 | Tools for agents   | ACP tools for ACP-hosted agents; MCP (`rmcp`) through a per-session stdio bridge for terminal agents (§4.1) |
 | IPC between layers | Named pipes (Windows) / unix sockets, versioned interfaces             |
-| Storage            | Project content as files in the project's `.tk/` folder (committed). Host state in the app's data folder. SQLite only as a cache or for runtime state. |
+| Storage            | Files. Project content in the project's `.tk/` folder (committed); host state in the app's data folder (`sessions/<id>/`). A database (SQLite) only if we ever need a cache. |
 | Config             | TOML, schema-validated, hot-reloaded                                   |
 | Primary platform   | Windows; keep macOS and Linux possible                                 |
 
