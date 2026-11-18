@@ -60,6 +60,77 @@ pub fn kill_pid(pid: u32) {
     let _ = cmd.status();
 }
 
+/// The PATH as it is saved now (machine + user), not as it was when this process started.
+/// Long-running layers use it so tools installed while the app runs (e.g. `claude`) are found.
+pub fn fresh_path() -> std::ffi::OsString {
+    #[cfg(windows)]
+    {
+        let read = |key: &str| -> Option<String> {
+            let mut cmd = std::process::Command::new("reg");
+            cmd.args(["query", key, "/v", "Path"]);
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(CREATE_NO_WINDOW);
+            }
+            let out = cmd.stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
+            let text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.lines().find_map(|l| {
+                let l = l.trim_start();
+                let rest = l.strip_prefix("Path").or_else(|| l.strip_prefix("PATH"))?.trim_start();
+                let rest = rest.strip_prefix("REG_EXPAND_SZ").or_else(|| rest.strip_prefix("REG_SZ"))?;
+                Some(expand_env(rest.trim()))
+            })
+        };
+        let machine = read(r"HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment");
+        let user = read(r"HKCU\Environment");
+        match (machine, user) {
+            (None, None) => std::env::var_os("PATH").unwrap_or_default(),
+            (m, u) => {
+                // Keep entries this process added at start (e.g. a dev shell), after the saved ones.
+                let mut parts: Vec<String> = [m, u].into_iter().flatten().collect();
+                if let Some(cur) = std::env::var_os("PATH") {
+                    parts.push(cur.to_string_lossy().into_owned());
+                }
+                parts.join(";").into()
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("PATH").unwrap_or_default()
+    }
+}
+
+/// Expand `%VAR%` references (registry REG_EXPAND_SZ values).
+pub fn expand_env(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) => {
+                let name = &after[..end];
+                match std::env::var(name) {
+                    Ok(v) if !name.is_empty() => out.push_str(&v),
+                    _ => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Write a file atomically (temp file + rename).
 pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -68,4 +139,20 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
     let tmp = path.with_extension(format!("tmp{}", std::process::id()));
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expands_known_vars_and_keeps_unknown() {
+        std::env::set_var("TK_TEST_DIR", r"C:\x");
+        assert_eq!(expand_env(r"%TK_TEST_DIR%\bin;%NOPE_TK%;50%"), r"C:\x\bin;%NOPE_TK%;50%");
+    }
+
+    #[test]
+    fn fresh_path_is_not_empty() {
+        assert!(!fresh_path().is_empty());
+    }
 }

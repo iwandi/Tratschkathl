@@ -301,7 +301,8 @@ impl Agents {
             return Err(format!("session limit ({}) reached", self.settings.max_sessions));
         }
         let id = format!("s{}{}", radix36(now_ms() as u64), self.counter.fetch_add(1, Ordering::Relaxed));
-        let (prog, mut args) = resolve_command(&agent)?;
+        let path_var = tk_bus::util::fresh_path();
+        let (prog, mut args) = resolve_command(&agent, &path_var)?;
 
         let vs = VersionState::load();
         let shim = vs.exe("helpers", "tk-shim", false).ok_or("helpers not installed")?;
@@ -327,7 +328,8 @@ impl Agents {
             .args(["--cols", &cols.to_string(), "--rows", &rows.to_string(), "--"])
             .arg(&prog)
             .args(&args)
-            .env("TK_HOME", paths::home());
+            .env("TK_HOME", paths::home())
+            .env("PATH", &path_var);
         tk_bus::util::detached_std(&mut cmd);
         cmd.spawn().map_err(|e| format!("starting shim: {e}"))?;
         tracing::info!("session {id}: {prog} {args:?} in {cwd}");
@@ -469,8 +471,11 @@ impl Agents {
     }
 }
 
-fn resolve_command(agent: &AgentConfig) -> Result<(String, Vec<String>), String> {
-    let path: PathBuf = which::which(&agent.command).map_err(|_| {
+/// Find the agent's executable on the PATH as saved now (`path_var`), so tools installed
+/// while the app runs are found without restarting it.
+fn resolve_command(agent: &AgentConfig, path_var: &std::ffi::OsString) -> Result<(String, Vec<String>), String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let path: PathBuf = which::which_in(&agent.command, Some(path_var), cwd).map_err(|_| {
         format!(
             "'{}' was not found on PATH. Edit the agents in {}",
             agent.command,
