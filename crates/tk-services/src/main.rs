@@ -1,6 +1,7 @@
 //! L2 Services: session registry, fact store, view engine, tool registry, and the plugin host
 //! for non-agent plugins (Git: facts and changesets; files: Markdown documents).
 
+mod commands;
 mod decisions;
 mod facts;
 mod files;
@@ -86,8 +87,6 @@ fn open_db() -> rusqlite::Result<Connection> {
          );",
     )?;
     db.execute_batch(facts::SCHEMA)?;
-    // Decisions moved to project files (.tk/decisions); drop the old tables.
-    db.execute_batch("DROP TABLE IF EXISTS decisions; DROP TABLE IF EXISTS kv;")?;
     Ok(db)
 }
 
@@ -171,6 +170,8 @@ impl Services {
                 let doc = tokio::task::spawn_blocking(move || me.document(&uri)).await.map_err(|e| e.to_string())??;
                 Ok(serde_json::to_value(doc).unwrap())
             }
+            "command.list" => Ok(serde_json::to_value(commands::parse(&commands::FILE.text(), &tools::names())?).unwrap()),
+            "command.run" => self.run_command(p).await,
             "tools.list" => Ok(tools::defs()),
             "tool.call" => tools::call(self, p),
             other => Err(format!("services: unknown method {other}")),
@@ -237,6 +238,48 @@ impl Services {
             .document_provider()
             .ok_or_else(|| format!("plugin '{provider}' provides no documents"))?
             .get(kind, reference)
+    }
+
+    /// Run an agent-configured UI command for the selected session (spec §6.1).
+    async fn run_command(self: &Arc<Self>, p: &Value) -> Result<Value, String> {
+        let id = p["id"].as_str().ok_or("id missing")?;
+        let session = p["session"].as_str().unwrap_or("").to_string();
+        let cmds = commands::parse(&commands::FILE.text(), &tools::names())?;
+        let cmd = cmds.into_iter().find(|c| c.id == id).ok_or_else(|| format!("no command '{id}'"))?;
+        let info = self.sessions(None)?.into_iter().find(|s| s.id == session);
+        let cwd = info.as_ref().map(|s| s.cwd.clone()).unwrap_or_default();
+        let mut facts_map = std::collections::BTreeMap::new();
+        for f in facts::current(&self.db.lock().unwrap(), Some(&session), None).map_err(|e| e.to_string())? {
+            facts_map.entry(f.key).or_insert(f.value);
+        }
+        let action = commands::fill(&cmd.action, &session, &cwd, &facts_map);
+        let bus = self.bus.get().ok_or("bus not ready")?.clone();
+        if let Some(tool) = action["tool"].as_str() {
+            let req = json!({ "session": "", "name": tool, "args": action["args"], "idem": format!("cmd-{id}-{}", tk_bus::model::now_ms()) });
+            if tool.starts_with("host_") {
+                bus.request_timeout("core", "tool.call", req, Duration::from_secs(1800)).await
+            } else {
+                tools::call(self, &req)
+            }
+        } else if let Some(text) = action["prompt"].as_str() {
+            if session.is_empty() {
+                return Err("select a session first".into());
+            }
+            bus.request_timeout("agents", "session.send_text", json!({ "session": session, "text": text }), Duration::from_secs(30)).await
+        } else if let Some(start) = action.get("start_session") {
+            let facts: Vec<FactInput> = start["facts"]
+                .as_object()
+                .map(|o| {
+                    o.iter()
+                        .filter_map(|(k, v)| v.as_str().filter(|v| !v.is_empty()).map(|v| FactInput { key: k.clone(), value: v.to_string(), kind: None }))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let req = json!({ "agent": start["agent"], "cwd": if cwd.is_empty() { Value::Null } else { json!(cwd) }, "facts": facts });
+            bus.request_timeout("agents", "session.create", req, Duration::from_secs(60)).await
+        } else {
+            Err("command has no action".into())
+        }
     }
 
     /// The project a session works in: its git worktree, or its folder outside git.

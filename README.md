@@ -4,9 +4,9 @@ A desktop orchestrator for LLM agent sessions, built in Rust with GPUI. It devel
 the agents that work on Tratschkathl run inside Tratschkathl, and the app reloads itself
 layer by layer while their sessions keep running. See [docs/SPEC.md](docs/SPEC.md).
 
-## Status: M2 (chat sessions and documents)
+## Status: M3 (views, commands, decisions)
 
-M0 (bootstrap), M1 (facts and the tree view) and M2 are done.
+M0 (bootstrap), M1 (facts and the tree view), M2 (chat sessions and documents) and M3 are done.
 
 - `tk-launcher`: stages builds into versioned folders, starts Core, reboots it and rolls it back.
 - `tk-core` (L1): bus hub, layer supervisor, `host_reload` / `host_rollback`, handoff store.
@@ -42,6 +42,8 @@ Agents are configured in `%LOCALAPPDATA%\Tratschkathl\settings.toml`. The defaul
 
 - facts: `fact_announce`, `fact_clear`, `fact_list`, `fact_query`
 - documents: `document_list`, `document_open`
+- decisions: `decision_log`, `decision_list`
+- workbench: `view_config_get`, `view_config_set`, `ui_command_list`, `ui_command_set`, `ui_command_remove`
 - sessions: `session_list`, `session_focus`
 - host: `host_status`, `host_reload`, `host_rollback`
 
@@ -63,6 +65,23 @@ The context dock lists documents for the session's facts:
 - its Markdown files (root and `docs/`, plus any `doc` facts)
 
 Open documents refresh by themselves while they are visible.
+
+## Views, commands and decisions
+
+Agents shape the workbench, and the user starts with a minimal surface (spec §6.1). Two files in the
+app's data folder hold this. Both are versioned, so an agent's change can be rolled back:
+
+- **`views.toml`**, set with `view_config_set`, defines the views:
+  - `tree`: the left dock, grouped by facts
+  - `board`: a kanban tab with columns by a fact; drag cards to change the fact, or press "+" in a column
+  - `chain`: the continuation bar on top, with sessions linked by a `continues` fact and "+ next"
+
+  A filter or scope can say `$selected.<key>` to follow the selected session.
+- **`commands.toml`**, set with `ui_command_set`, defines commands for the command palette (Ctrl+Shift+P) and
+  for the context dock. A command calls a tool, sends a prompt, or starts a session.
+
+Decisions are project content. They live in `<project>/.tk/decisions/`, one Markdown file each, and are
+committed with the code. Tratschkathl's own automatic decisions (reloads, rollbacks) show as "Host decisions".
 
 ## Facts and views
 

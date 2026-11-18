@@ -114,10 +114,24 @@ struct Workbench {
     /// Unsent chat input by session.
     drafts: HashMap<String, String>,
     chat_requested: HashSet<String>,
+    /// Agent-configured UI commands (spec §6.1).
+    commands: Vec<Value>,
+    /// Command palette: (query, selected index) while open.
+    palette: Option<(String, usize)>,
+    palette_focus: FocusHandle,
+}
+
+fn is_palette_key(ev: &KeyDownEvent) -> bool {
+    let m = &ev.keystroke.modifiers;
+    m.control && m.shift && ev.keystroke.key == "p"
 }
 
 fn is_doc(id: &str) -> bool {
     id.starts_with(DOC_PREFIX)
+}
+
+fn has_placement(c: &Value, place: &str) -> bool {
+    c["placement"].as_array().is_some_and(|a| a.iter().any(|p| p == place))
 }
 
 fn is_view(id: &str) -> bool {
@@ -184,6 +198,7 @@ fn main() {
                 "views.".into(),
                 "chat.".into(),
                 "decisions.".into(),
+                "commands.".into(),
             ],
             Some(h),
         )
@@ -299,6 +314,7 @@ impl Workbench {
                     wb.notice("UI reloaded; layout restored");
                 }
                 wb.refresh_views(cx);
+                wb.refresh_commands(cx);
                 cx.notify();
             });
             let _ = bus2.request("agents", "term.refresh", json!({})).await;
@@ -348,6 +364,9 @@ impl Workbench {
             chat_scroll: HashMap::new(),
             drafts: HashMap::new(),
             chat_requested: HashSet::new(),
+            commands: vec![],
+            palette: None,
+            palette_focus: cx.focus_handle(),
         }
     }
 
@@ -547,6 +566,7 @@ impl Workbench {
             }
             "views.changed" => self.refresh_views(cx),
             "chat.items" => self.apply_chat(&data),
+            "commands.changed" => self.refresh_commands(cx),
             "decisions.changed" => {
                 for uri in self.visible_docs().into_iter().filter(|u| u.contains("/decision-list/")) {
                     self.fetch_doc(uri, cx);
@@ -673,7 +693,10 @@ impl Workbench {
     fn context_session(&self) -> Option<String> {
         match self.active_tab() {
             Some(t) if !is_doc(&t) && !is_view(&t) => Some(t),
-            _ => self.last_session.clone(),
+            _ => self.last_session.clone().or_else(|| {
+                // After a reload: the first session tab in any pane.
+                self.panes.iter().flat_map(|p| p.tabs.iter()).find(|t| !is_doc(t) && !is_view(t)).cloned()
+            }),
         }
     }
 
@@ -1026,6 +1049,9 @@ impl Workbench {
                     .child(row("Folder", s.cwd.clone()))
                     .child(row("State", s.state.clone()))
                     .child(row("Session", s.id.clone()))
+                    .when(self.commands.iter().any(|c| has_placement(c, "session")), |d| {
+                        d.child(section_header("COMMANDS")).child(self.render_session_commands(&s.id, cx))
+                    })
                     .child(section_header("FACTS"))
                     .child(self.render_facts(&s.id))
                     .child(section_header("DOCUMENTS"))
@@ -1214,8 +1240,12 @@ impl Workbench {
             .border_color(rgb(if focused { ACCENT } else { BORDER }))
             .bg(rgb(PANEL))
             .cursor_text()
-            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
                 cx.stop_propagation();
+                if is_palette_key(ev) {
+                    this.open_palette(window, cx);
+                    return;
+                }
                 this.on_chat_key(&sid_key, ev, cx);
             }))
             .on_mouse_down(
@@ -1518,7 +1548,7 @@ impl Workbench {
         for k in &board.unresolved {
             head = head.child(div().text_xs().text_color(rgb(0xe5c07b)).child(format!("select a session with a `{k}` fact to filter")));
         }
-        let mut cols = div().flex_1().min_h_0().flex().flex_row().gap_3();
+        let mut cols = div().id(SharedString::from(format!("board-cols-{pi}"))).flex_1().min_h_0().flex().flex_row().gap_3().overflow_x_scroll();
         for (ci, col) in board.columns.iter().enumerate() {
             let value = col.value.clone();
             let label = if value.is_empty() { "(none)".to_string() } else { value.clone() };
@@ -1533,7 +1563,7 @@ impl Workbench {
             let mut column = div()
                 .id(("board-col", ci))
                 .flex_1()
-                .min_w(px(200.0))
+                .min_w(px(180.0))
                 .h_full()
                 .p_2()
                 .rounded_md()
@@ -1612,6 +1642,188 @@ impl Workbench {
             .child(head)
             .child(cols)
             .into_any_element()
+    }
+
+    fn refresh_commands(&self, cx: &mut Context<Self>) {
+        let bus = self.bus.clone();
+        cx.spawn(async move |this, cx| {
+            if let Ok(v) = bus.request("services", "command.list", json!({})).await {
+                let _ = this.update(cx, |wb, cx| {
+                    wb.commands = v.as_array().cloned().unwrap_or_default();
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn run_command(&mut self, id: String, cx: &mut Context<Self>) {
+        let session = self.context_session().unwrap_or_default();
+        let label = self.commands.iter().find(|c| c["id"] == id.as_str()).and_then(|c| c["label"].as_str()).unwrap_or(&id).to_string();
+        let bus = self.bus.clone();
+        self.notice(format!("Running: {label}"));
+        cx.spawn(async move |this, cx| {
+            let res = bus.request("services", "command.run", json!({ "id": id, "session": session })).await;
+            let _ = this.update(cx, |wb, cx| {
+                wb.notice(match res {
+                    Ok(_) => format!("Done: {label}"),
+                    Err(e) => format!("{label} failed: {e}"),
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette = Some((String::new(), 0));
+        window.focus(&self.palette_focus);
+        cx.notify();
+    }
+
+    fn palette_matches(&self) -> Vec<(String, String, String)> {
+        let q = self.palette.as_ref().map(|p| p.0.to_lowercase()).unwrap_or_default();
+        self.commands
+            .iter()
+            .filter(|c| has_placement(c, "palette"))
+            .map(|c| {
+                (
+                    c["id"].as_str().unwrap_or("").to_string(),
+                    c["label"].as_str().unwrap_or("").to_string(),
+                    c["description"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .filter(|(_, label, desc)| q.is_empty() || label.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q))
+            .collect()
+    }
+
+    fn on_palette_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let matches = self.palette_matches();
+        let Some((query, sel)) = self.palette.as_mut() else { return };
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.palette = None;
+                self.want_focus = true;
+            }
+            "enter" => {
+                let pick = matches.get(*sel).map(|m| m.0.clone());
+                self.palette = None;
+                self.want_focus = true;
+                if let Some(id) = pick {
+                    self.run_command(id, cx);
+                }
+            }
+            "up" => *sel = sel.saturating_sub(1),
+            "down" => *sel = (*sel + 1).min(matches.len().saturating_sub(1)),
+            "backspace" => {
+                query.pop();
+                *sel = 0;
+            }
+            "space" => query.push(' '),
+            _ => {
+                if let Some(c) = &ev.keystroke.key_char {
+                    if !ev.keystroke.modifiers.control {
+                        query.push_str(c);
+                        *sel = 0;
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_palette(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (query, sel) = self.palette.clone()?;
+        let matches = self.palette_matches();
+        let mut list = div().flex().flex_col();
+        if matches.is_empty() {
+            list = list.child(div().p_3().text_color(rgb(DIM)).child(if self.commands.is_empty() {
+                "No commands yet. Agents add them with ui_command_set."
+            } else {
+                "No matching command."
+            }));
+        }
+        for (i, (id, label, desc)) in matches.into_iter().enumerate() {
+            list = list.child(
+                div()
+                    .id(("palette-item", i))
+                    .px_3()
+                    .py_2()
+                    .flex()
+                    .flex_col()
+                    .cursor_pointer()
+                    .when(i == sel, |d| d.bg(rgb(0x264f78)))
+                    .hover(|d| d.bg(rgb(BTN_HOVER)))
+                    .child(label)
+                    .when(!desc.is_empty(), |d| d.child(div().text_xs().text_color(rgb(DIM)).child(desc)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.palette = None;
+                        this.want_focus = true;
+                        this.run_command(id.clone(), cx);
+                    })),
+            );
+        }
+        let focus = self.palette_focus.clone();
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .flex()
+                .flex_col()
+                .items_center()
+                .pt(px(80.0))
+                .bg(gpui::rgba(0x0000_0066))
+                .child(
+                    div()
+                        .id("palette")
+                        .track_focus(&focus)
+                        .w(px(560.0))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(ACCENT))
+                        .bg(rgb(PANEL))
+                        .shadow_lg()
+                        .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.on_palette_key(ev, cx);
+                        }))
+                        .child(
+                            div()
+                                .p_3()
+                                .border_b_1()
+                                .border_color(rgb(BORDER))
+                                .child(if query.is_empty() {
+                                    div().text_color(rgb(DIM)).child("Run a command…")
+                                } else {
+                                    div().child(query)
+                                }),
+                        )
+                        .child(list),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_session_commands(&self, _sid: &str, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let mut row = div().px_3().flex().flex_row().flex_wrap().gap_1();
+        for (i, c) in self.commands.iter().filter(|c| has_placement(c, "session")).enumerate() {
+            let id = c["id"].as_str().unwrap_or("").to_string();
+            row = row.child(
+                div()
+                    .id(("session-cmd", i))
+                    .px_2()
+                    .py(px(2.0))
+                    .rounded_sm()
+                    .bg(rgb(BTN))
+                    .hover(|d| d.bg(rgb(BTN_HOVER)))
+                    .cursor_pointer()
+                    .child(c["label"].as_str().unwrap_or("").to_string())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.run_command(id.clone(), cx))),
+            );
+        }
+        row.into_any_element()
     }
 
     fn render_doc_list(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
@@ -1918,8 +2130,12 @@ impl Workbench {
             .text_size(px(self.font_size))
             .line_height(px(line_h))
             .text_color(rgb(0xd4d4d4))
-            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, window, cx| {
                 cx.stop_propagation();
+                if is_palette_key(ev) {
+                    this.open_palette(window, cx);
+                    return;
+                }
                 this.on_key(&sid_key, ev, cx);
             }))
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, _| this.on_scroll(&sid_scroll, ev)))
@@ -2055,13 +2271,21 @@ impl Render for Workbench {
         let panes: Vec<gpui::AnyElement> =
             (0..self.panes.len()).map(|pi| self.render_pane(pi, cx).into_any_element()).collect();
         let status = self.notices.last().cloned().unwrap_or_default();
+        let palette = self.render_palette(cx);
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .text_sm()
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if is_palette_key(ev) {
+                    this.open_palette(window, cx);
+                }
+            }))
+            .children(palette)
             .child(
                 div()
                     .flex_1()

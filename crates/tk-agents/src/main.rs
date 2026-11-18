@@ -188,6 +188,25 @@ impl Agents {
                 }
                 Ok(json!({ "state": chat.state }))
             }
+            "session.send_text" => {
+                // A UI command's prompt: chat sessions get a prompt, terminals get the text typed
+                // (bracketed paste) and Enter.
+                let id = p["session"].as_str().ok_or("session missing")?;
+                let text = p["text"].as_str().unwrap_or("");
+                let sess = self.get(id).ok_or("session is not running")?;
+                let mut s = sess.lock().unwrap();
+                let tx = s.shim_tx.clone().ok_or("session not attached yet")?;
+                if let Some(chat) = s.chat.as_mut() {
+                    for l in chat.prompt(text)? {
+                        let _ = tx.send(json!({ "t": "send", "line": l }).to_string() + "\n");
+                    }
+                } else {
+                    let mut bytes = s.model.paste_bytes(text);
+                    bytes.push(b'\r');
+                    let _ = tx.send(json!({ "t": "input", "b64": b64e(&bytes) }).to_string() + "\n");
+                }
+                Ok(json!(true))
+            }
             "chat.history" => {
                 // Transcript of a session that is no longer running, rebuilt from its ACP log.
                 let id = p["session"].as_str().ok_or("session missing")?;

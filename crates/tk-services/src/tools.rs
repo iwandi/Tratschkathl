@@ -7,6 +7,11 @@ use tk_bus::model::FactInput;
 
 use crate::{facts, Services};
 
+/// Names of all tools in the registry.
+pub fn names() -> Vec<String> {
+    defs().as_array().into_iter().flatten().filter_map(|t| t["name"].as_str().map(String::from)).collect()
+}
+
 pub fn defs() -> Value {
     json!([
         {
@@ -124,6 +129,37 @@ pub fn defs() -> Value {
                     "restore": { "type": "string", "description": "Instead of toml: an earlier version id to restore." }
                 }
             }
+        },
+        {
+            "name": "ui_command_list",
+            "description": "List the UI commands agents have given the user (commands.toml).",
+            "inputSchema": { "type": "object", "properties": {} }
+        },
+        {
+            "name": "ui_command_set",
+            "description": "Give the user a command (spec: the user surface is minimal; commands exist because an agent adds them). Adds or replaces a command by id. placement: \"palette\" (Ctrl+Shift+P) and/or \"session\" (button in the context dock for the selected session). action is exactly one of: {\"tool\": name, \"args\": {...}} to call a Tratschkathl tool; {\"prompt\": text} to send text to the selected session; {\"start_session\": {\"agent\": id, \"facts\": {...}}} to start a session in its folder. Strings may use $session.id, $session.cwd and $fact.<key> (the selected session). Validated and versioned.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string" },
+                            "label": { "type": "string" },
+                            "description": { "type": "string" },
+                            "placement": { "type": "array", "items": { "type": "string", "enum": ["palette", "session"] } },
+                            "action": { "type": "object" }
+                        },
+                        "required": ["id", "label", "action"]
+                    }
+                },
+                "required": ["command"]
+            }
+        },
+        {
+            "name": "ui_command_remove",
+            "description": "Remove a UI command by id.",
+            "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } }, "required": ["id"] }
         },
         {
             "name": "document_list",
@@ -251,6 +287,33 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
                 "note": "Commit the file with your change."
             }))
         }
+        "ui_command_list" => Ok(serde_json::to_value(crate::commands::parse(&crate::commands::FILE.text(), &names())?).unwrap()),
+        "ui_command_set" | "ui_command_remove" => {
+            let file = &crate::commands::FILE;
+            let mut cmds = crate::commands::parse(&file.text(), &names())?;
+            let id = if name == "ui_command_set" {
+                let c: crate::commands::UiCommand =
+                    serde_json::from_value(args["command"].clone()).map_err(|e| format!("command: {e}"))?;
+                crate::commands::validate(&c, &names())?;
+                let id = c.id.clone();
+                match cmds.iter_mut().find(|x| x.id == c.id) {
+                    Some(x) => *x = c,
+                    None => cmds.push(c),
+                }
+                id
+            } else {
+                let id = args["id"].as_str().ok_or("id missing")?.to_string();
+                let before = cmds.len();
+                cmds.retain(|c| c.id != id);
+                if cmds.len() == before {
+                    return Err(format!("no command '{id}'"));
+                }
+                id
+            };
+            let saved = file.set(&crate::commands::render(&cmds), |t| crate::commands::parse(t, &names()).map(|_| ()))?;
+            svc.emit("commands.changed", json!({}));
+            Ok(json!({ "id": id, "commands": cmds.len(), "previous_version": saved }))
+        }
         "view_config_get" => {
             let file = &crate::views::FILE;
             let text = match args["version"].as_str() {
@@ -281,7 +344,9 @@ pub fn call(svc: &Services, params: &Value) -> Result<Value, String> {
         }
         "document_open" => {
             let uri = args["uri"].as_str().ok_or("uri missing")?;
-            tk_bus::model::parse_doc_uri(uri).ok_or("uri must come from document_list")?;
+            if tk_bus::model::parse_doc_uri(uri).is_none() && !uri.starts_with("tk://view/") {
+                return Err("uri must come from document_list, or be tk://view/<view id>".into());
+            }
             svc.emit("workbench.open_document", json!({ "uri": uri, "placement": args["placement"].as_str().unwrap_or("tab") }));
             Ok(json!({ "opened": uri }))
         }
