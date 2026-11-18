@@ -4,13 +4,18 @@ A desktop orchestrator for LLM agent sessions, built in Rust with GPUI. It devel
 the agents that work on Tratschkathl run inside Tratschkathl, and the app reloads itself
 layer by layer while their sessions keep running. See [docs/SPEC.md](docs/SPEC.md).
 
-## Status: M0 (bootstrap)
+## Status: M1 (facts and the tree view)
+
+M0 (bootstrap) and M1 are done.
 
 - `tk-launcher`: stages builds into versioned folders, starts Core, reboots it and rolls it back.
 - `tk-core` (L1): bus hub, layer supervisor, `host_reload` / `host_rollback`, handoff store.
-- `tk-services` (L2): session registry (SQLite) and the tool registry.
+- `tk-services` (L2): session registry, fact store, view engine, tool registry, and the plugin host.
 - `tk-agents` (L3): session lifecycle and terminal emulation (alacritty_terminal).
-- `tk-ui` (L4): the GPUI workbench. It has a session list, tabbed and split panes, terminal tabs and a context dock.
+- `tk-ui` (L4): the GPUI workbench. It has the configured views and a session list on the left,
+  tabbed and split panes, terminal tabs, and a context dock that shows the active session's facts.
+- `tk-plugin-api`: capability traits. `plugins/tk-plugin-git` derives `project`, `repo`, `branch`
+  and `worktree` facts from each session's folder.
 - `tk-shim`: one per session. It owns the PTY, so every layer can restart without killing the agent.
 - `tk-mcp-bridge`: the stdio MCP server that Claude Code starts. It holds tool calls while layers reload.
 - `tk-ctl`: a small debugging client for the bus.
@@ -31,7 +36,21 @@ different data folder. Logs are written to `%LOCALAPPDATA%\Tratschkathl\logs\`.
 
 Agents are configured in `%LOCALAPPDATA%\Tratschkathl\settings.toml`. The defaults are Claude Code
 (`claude`, which must be on `PATH`) and PowerShell. Claude Code sessions automatically get the
-`tratschkathl` MCP server with `host_status`, `host_reload`, `host_rollback` and `session_list`.
+`tratschkathl` MCP server with these tools:
+
+- facts: `fact_announce`, `fact_clear`, `fact_list`, `fact_query`
+- sessions: `session_list`, `session_focus`
+- host: `host_status`, `host_reload`, `host_rollback`
+
+## Facts and views
+
+Every session carries facts, such as `project`, `branch`, `issue` and `phase`. Agents announce them,
+the Git plugin derives them, and "+" in a view seeds them. A derived fact never overrides one
+that an agent or the user set.
+
+Views are defined in `%LOCALAPPDATA%\Tratschkathl\views.toml`, and edits show up live. The
+default is a tree grouped by `project`, then `branch`, then `issue`. "+" on a node starts a
+session in that context: it uses the node's facts and the folder of the newest session under the node.
 
 ## Developing inside the app
 

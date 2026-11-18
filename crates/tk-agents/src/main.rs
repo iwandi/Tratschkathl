@@ -131,6 +131,18 @@ impl Agents {
                 let cols = p["cols"].as_u64().unwrap_or(120) as u16;
                 let rows = p["rows"].as_u64().unwrap_or(36) as u16;
                 let info = self.create(agent, &cwd, cols, rows).await?;
+                // Facts the session starts with ("+" on a view node): spec §4.3.
+                if let Some(facts) = p.get("facts").filter(|f| f.as_array().is_some_and(|a| !a.is_empty())) {
+                    let source = if inc.from == "ui" { "user" } else { "agent" };
+                    self.bus()
+                        .request_timeout(
+                            "services",
+                            "fact.seed",
+                            json!({ "session": info.id, "facts": facts, "source": source }),
+                            Duration::from_secs(30),
+                        )
+                        .await?;
+                }
                 Ok(serde_json::to_value(info).unwrap())
             }
             "session.kill" => {

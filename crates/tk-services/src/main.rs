@@ -1,30 +1,40 @@
-//! L2 Services (thin for M0): session registry in SQLite and the tool registry. Facts, views,
-//! decisions, automation and resources arrive here in later milestones.
+//! L2 Services: session registry, fact store, view engine, tool registry, and the plugin host
+//! for non-agent plugins (M1: the Git fact deriver).
 
-use std::sync::{Arc, Mutex};
+mod facts;
+mod tools;
+mod views;
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 
-use tk_bus::model::SessionInfo;
+use tk_bus::model::{FactInput, SessionInfo};
 use tk_bus::{client::handler, Bus, Incoming};
+use tk_plugin_api::{Plugin, SessionContext};
 
-struct Services {
+pub struct Services {
     db: Mutex<Connection>,
-    bus: std::sync::OnceLock<Bus>,
+    bus: OnceLock<Bus>,
+    plugins: Vec<Box<dyn Plugin>>,
 }
 
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--self-test") {
-        // Prove the DB opens and migrates.
-        match open_db() {
-            Ok(_) => println!("{}", tk_bus::self_test_json("services")),
-            Err(e) => {
-                eprintln!("db: {e}");
-                std::process::exit(1);
-            }
+        // Prove the DB opens and migrates, and the view config parses.
+        if let Err(e) = open_db() {
+            eprintln!("db: {e}");
+            std::process::exit(1);
         }
+        if let Err(e) = views::load() {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+        println!("{}", tk_bus::self_test_json("services"));
         return;
     }
     tk_bus::logging::init("services");
@@ -35,18 +45,26 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let svc = Arc::new(Services { db: Mutex::new(db), bus: Default::default() });
+    let svc = Arc::new(Services { db: Mutex::new(db), bus: OnceLock::new(), plugins: plugins() });
     let h = {
         let svc = svc.clone();
         handler(move |inc| {
             let svc = svc.clone();
-            async move { svc.handle(inc) }
+            async move { svc.handle(inc).await }
         })
     };
     let (bus, _events) = Bus::connect("services", env!("CARGO_PKG_VERSION"), vec![], Some(h));
     let _ = svc.bus.set(bus);
-    tracing::info!("services up");
+    tracing::info!("services up with plugins {:?}", svc.plugins.iter().map(|p| p.id()).collect::<Vec<_>>());
+
+    // Fact derivation for running sessions, and views.toml change detection.
+    tokio::spawn(svc.clone().background());
     std::future::pending::<()>().await;
+}
+
+/// Plugins compiled into this layer (spec §5.2, v1 model).
+fn plugins() -> Vec<Box<dyn Plugin>> {
+    vec![Box::new(tk_plugin_git::GitPlugin)]
 }
 
 fn open_db() -> rusqlite::Result<Connection> {
@@ -64,17 +82,18 @@ fn open_db() -> rusqlite::Result<Connection> {
             created_at INTEGER NOT NULL
          );",
     )?;
+    db.execute_batch(facts::SCHEMA)?;
     Ok(db)
 }
 
 impl Services {
-    fn emit(&self, topic: &str, data: Value) {
+    pub fn emit(&self, topic: &str, data: Value) {
         if let Some(bus) = self.bus.get() {
             bus.emit(topic, data);
         }
     }
 
-    fn handle(&self, inc: Incoming) -> Result<Value, String> {
+    async fn handle(self: &Arc<Self>, inc: Incoming) -> Result<Value, String> {
         let p = &inc.params;
         match inc.method.as_str() {
             "layer.shutdown" => {
@@ -92,43 +111,60 @@ impl Services {
                     )
                     .map_err(|e| e.to_string())?;
                 self.emit("sessions.changed", json!({ "id": s.id }));
+                let me = self.clone();
+                tokio::spawn(async move { me.derive_for(&s).await });
                 Ok(json!(true))
             }
             "session.update" => {
                 let id = p["id"].as_str().ok_or("id missing")?;
-                let db = self.db.lock().unwrap();
-                if let Some(state) = p["state"].as_str() {
-                    db.execute("UPDATE sessions SET state=?1 WHERE id=?2", params![state, id]).map_err(|e| e.to_string())?;
+                {
+                    let db = self.db.lock().unwrap();
+                    if let Some(state) = p["state"].as_str() {
+                        db.execute("UPDATE sessions SET state=?1 WHERE id=?2", params![state, id]).map_err(|e| e.to_string())?;
+                    }
+                    if let Some(title) = p["title"].as_str() {
+                        db.execute("UPDATE sessions SET title=?1 WHERE id=?2", params![title, id]).map_err(|e| e.to_string())?;
+                    }
                 }
-                if let Some(title) = p["title"].as_str() {
-                    db.execute("UPDATE sessions SET title=?1 WHERE id=?2", params![title, id]).map_err(|e| e.to_string())?;
-                }
-                drop(db);
                 self.emit("sessions.changed", json!({ "id": id }));
                 Ok(json!(true))
             }
             "session.list" => Ok(serde_json::to_value(self.sessions(p["state"].as_str())?).unwrap()),
-            "tools.list" => Ok(tool_defs()),
-            "tool.call" => {
-                let name = p["name"].as_str().unwrap_or("");
-                match name {
-                    "session_list" => Ok(serde_json::to_value(self.sessions(p["args"]["state"].as_str())?).unwrap()),
-                    "session_focus" => {
-                        let id = p["args"]["session"].as_str().or(p["session"].as_str()).ok_or("session missing")?;
-                        if !self.sessions(None)?.iter().any(|s| s.id == id) {
-                            return Err(format!("unknown session {id}"));
-                        }
-                        self.emit("workbench.focus", json!({ "session": id }));
-                        Ok(json!({ "focused": id }))
+            "fact.seed" => {
+                // Facts a new session starts with (from "+" in a view), recorded as user facts.
+                let session = p["session"].as_str().ok_or("session missing")?;
+                let list: Vec<FactInput> = serde_json::from_value(p["facts"].clone()).unwrap_or_default();
+                let source = p["source"].as_str().unwrap_or("user");
+                {
+                    let db = self.db.lock().unwrap();
+                    for f in &list {
+                        facts::announce(&db, session, f, source, None)?;
                     }
-                    other => Err(format!("unknown tool {other}")),
                 }
+                self.facts_changed(session);
+                Ok(json!(list.len()))
             }
+            "fact.list" => {
+                let db = self.db.lock().unwrap();
+                let list = facts::current(&db, p["session"].as_str(), p["key"].as_str()).map_err(|e| e.to_string())?;
+                Ok(serde_json::to_value(list).unwrap())
+            }
+            "view.render" => {
+                let sessions = self.sessions(None)?;
+                let all = facts::current(&self.db.lock().unwrap(), None, None).map_err(|e| e.to_string())?;
+                Ok(serde_json::to_value(views::render_all(&sessions, &all)?).unwrap())
+            }
+            "tools.list" => Ok(tools::defs()),
+            "tool.call" => tools::call(self, p),
             other => Err(format!("services: unknown method {other}")),
         }
     }
 
-    fn sessions(&self, state: Option<&str>) -> Result<Vec<SessionInfo>, String> {
+    pub fn facts_changed(&self, session: &str) {
+        self.emit("facts.changed", json!({ "session": session }));
+    }
+
+    pub fn sessions(&self, state: Option<&str>) -> Result<Vec<SessionInfo>, String> {
         let db = self.db.lock().unwrap();
         let mut stmt = db
             .prepare("SELECT id, kind, agent, title, cwd, state, created_at FROM sessions ORDER BY created_at DESC")
@@ -151,46 +187,52 @@ impl Services {
             .filter(|s| state.map_or(true, |st| s.state == st))
             .collect())
     }
-}
 
-/// Tool registry exposed to agents (MCP for terminal agents, ACP tools later).
-fn tool_defs() -> Value {
-    json!([
-        {
-            "name": "host_status",
-            "description": "Show the running Tratschkathl layers (core, services, agents, ui), their versions (current / previous / last known good) and the source checkout used for reloads.",
-            "inputSchema": { "type": "object", "properties": {} }
-        },
-        {
-            "name": "host_reload",
-            "description": "Rebuild Tratschkathl from its source checkout and reload the layers whose binaries changed (bottom-up: helpers, core, services, agents, ui). Each new binary must pass a self-test first; a layer that does not come up is rolled back. Agent sessions, including yours, survive the reload. Returns per-layer versions, self-test output, or build errors.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "layers": { "type": "array", "items": { "type": "string", "enum": ["helpers", "core", "services", "agents", "ui"] },
-                                "description": "Limit the reload to these units. Default: every unit whose binary changed." },
-                    "reason": { "type": "string", "description": "Why you are reloading; goes to the decision log." }
+    /// Run every fact deriver for one session and apply the result.
+    async fn derive_for(self: &Arc<Self>, s: &SessionInfo) {
+        let me = self.clone();
+        let ctx = SessionContext { session: s.id.clone(), cwd: PathBuf::from(&s.cwd) };
+        let changed = tokio::task::spawn_blocking(move || {
+            let mut changed = false;
+            for plugin in &me.plugins {
+                let Some(d) = plugin.fact_deriver() else { continue };
+                let derived = d.derive(&ctx);
+                let db = me.db.lock().unwrap();
+                match facts::apply_derived(&db, &ctx.session, plugin.id(), &derived) {
+                    Ok(c) => changed |= c,
+                    Err(e) => tracing::warn!("{}: deriving facts for {} failed: {e}", plugin.id(), ctx.session),
                 }
             }
-        },
-        {
-            "name": "host_rollback",
-            "description": "Roll one layer back to its last known good (or previous) version.",
-            "inputSchema": {
-                "type": "object",
-                "properties": { "layer": { "type": "string", "enum": ["core", "services", "agents", "ui", "helpers"] } },
-                "required": ["layer"]
-            }
-        },
-        {
-            "name": "session_focus",
-            "description": "Bring a session to the front of the user's workbench (opens or activates its tab). Without a session id it focuses your own session.",
-            "inputSchema": { "type": "object", "properties": { "session": { "type": "string" } } }
-        },
-        {
-            "name": "session_list",
-            "description": "List agent sessions known to Tratschkathl.",
-            "inputSchema": { "type": "object", "properties": { "state": { "type": "string", "enum": ["running", "ended"] } } }
+            changed
+        })
+        .await
+        .unwrap_or(false);
+        if changed {
+            self.facts_changed(&s.id);
         }
-    ])
+    }
+
+    async fn background(self: Arc<Self>) {
+        let mut views_mtime: Option<SystemTime> = None;
+        let mut tick: u64 = 0;
+        loop {
+            // views.toml edits (by hand or by an agent) show up without a restart.
+            let m = std::fs::metadata(views::path()).and_then(|m| m.modified()).ok();
+            if views_mtime.is_some() && m != views_mtime {
+                self.emit("views.changed", json!({}));
+            }
+            views_mtime = m;
+
+            // Re-derive facts every 10 s: branches change under running sessions.
+            if tick % 5 == 0 {
+                if let Ok(running) = self.sessions(Some("running")) {
+                    for s in running {
+                        self.derive_for(&s).await;
+                    }
+                }
+            }
+            tick += 1;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
 }

@@ -2,7 +2,7 @@
 //! sessions come from Services, terminal frames from the Agent Handler. The layout is handed
 //! to the next UI version on reload.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use gpui::prelude::*;
@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot};
 
 use tk_bus::frame::{Frame, KeyInput, Run, BOLD, ITALIC, UNDERLINE};
-use tk_bus::model::{AgentConfig, SessionInfo};
+use tk_bus::model::{AgentConfig, Fact, FactInput, RenderedView, SessionInfo, TreeNode};
 use tk_bus::settings::Settings;
 use tk_bus::{client::handler, Bus};
 
@@ -79,6 +79,14 @@ struct Workbench {
     line_h: f32,
     want_focus: bool,
     scroll_acc: f32,
+    /// Rendered views from Services (spec §4.3).
+    views: Vec<RenderedView>,
+    /// Collapsed tree nodes, by node key.
+    collapsed: HashSet<String>,
+    /// Node whose "+" agent picker is open.
+    create_at: Option<String>,
+    /// Facts of the active session (session id, facts).
+    active_facts: (Option<String>, Vec<Fact>),
 }
 
 fn main() {
@@ -110,7 +118,15 @@ fn main() {
         Bus::connect(
             "ui",
             env!("CARGO_PKG_VERSION"),
-            vec!["term.".into(), "sessions.".into(), "host.".into(), "layer.".into(), "workbench.".into()],
+            vec![
+                "term.".into(),
+                "sessions.".into(),
+                "host.".into(),
+                "layer.".into(),
+                "workbench.".into(),
+                "facts.".into(),
+                "views.".into(),
+            ],
             Some(h),
         )
     };
@@ -224,6 +240,7 @@ impl Workbench {
                     wb.restore_layout(layout, cx);
                     wb.notice("UI reloaded; layout restored");
                 }
+                wb.refresh_views(cx);
                 cx.notify();
             });
             let _ = bus2.request("agents", "term.refresh", json!({})).await;
@@ -247,6 +264,10 @@ impl Workbench {
             line_h,
             want_focus: true,
             scroll_acc: 0.0,
+            views: vec![],
+            collapsed: HashSet::new(),
+            create_at: None,
+            active_facts: (None, vec![]),
         }
     }
 
@@ -368,7 +389,17 @@ impl Workbench {
                     self.frames.insert(id.to_string(), frame);
                 }
             }
-            "term.ended" | "sessions.changed" => self.refresh_sessions(cx),
+            "term.ended" | "sessions.changed" => {
+                self.refresh_sessions(cx);
+                self.refresh_views(cx);
+            }
+            "facts.changed" => {
+                self.refresh_views(cx);
+                if data["session"].as_str() == self.active_facts.0.as_deref() {
+                    self.active_facts.0 = None; // refetched on next render
+                }
+            }
+            "views.changed" => self.refresh_views(cx),
             "workbench.focus" => {
                 if let Some(id) = data["session"].as_str() {
                     self.open_tab(id);
@@ -396,7 +427,11 @@ impl Workbench {
                     })
                     .detach();
                 }
-                Some("services") => self.refresh_sessions(cx),
+                Some("services") => {
+                    self.refresh_sessions(cx);
+                    self.refresh_views(cx);
+                    self.active_facts.0 = None;
+                }
                 _ => {}
             },
             _ => {}
@@ -404,19 +439,31 @@ impl Workbench {
         cx.notify();
     }
 
-    fn new_session(&mut self, agent: String, cx: &mut Context<Self>) {
-        let rx = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: false,
-            prompt: Some("Choose the working folder".into()),
-        });
+    /// Start a session. Without a folder the user picks one; `facts` pre-seed the session
+    /// ("+" on a view node, spec §4.3).
+    fn new_session(&mut self, agent: String, cwd: Option<String>, facts: Vec<FactInput>, cx: &mut Context<Self>) {
+        let rx = match cwd {
+            Some(_) => None,
+            None => Some(cx.prompt_for_paths(PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Choose the working folder".into()),
+            })),
+        };
         let bus = self.bus.clone();
         cx.spawn(async move |this, cx| {
-            let Ok(Ok(Some(paths))) = rx.await else { return };
-            let Some(dir) = paths.into_iter().next() else { return };
+            let dir = match (cwd, rx) {
+                (Some(c), _) => c,
+                (None, Some(rx)) => {
+                    let Ok(Ok(Some(paths))) = rx.await else { return };
+                    let Some(dir) = paths.into_iter().next() else { return };
+                    dir.to_string_lossy().into_owned()
+                }
+                (None, None) => return,
+            };
             let res = bus
-                .request("agents", "session.create", json!({ "agent": agent, "cwd": dir.to_string_lossy() }))
+                .request("agents", "session.create", json!({ "agent": agent, "cwd": dir, "facts": facts }))
                 .await;
             let _ = this.update(cx, |wb, cx| {
                 match res.and_then(|v| serde_json::from_value::<SessionInfo>(v).map_err(|e| e.to_string())) {
@@ -431,6 +478,48 @@ impl Workbench {
                 }
                 cx.notify();
             });
+        })
+        .detach();
+    }
+
+    fn refresh_views(&self, cx: &mut Context<Self>) {
+        let bus = self.bus.clone();
+        cx.spawn(async move |this, cx| {
+            let res = bus.request("services", "view.render", json!({})).await;
+            let _ = this.update(cx, |wb, cx| {
+                match res.and_then(|v| serde_json::from_value::<Vec<RenderedView>>(v).map_err(|e| e.to_string())) {
+                    Ok(v) => wb.views = v,
+                    Err(e) => wb.notice(format!("Views: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Keep the context dock's facts in step with the active session.
+    fn sync_active_facts(&mut self, cx: &mut Context<Self>) {
+        let active = self.panes.get(self.active_pane).and_then(|p| p.tabs.get(p.active)).cloned();
+        if active == self.active_facts.0 && active.is_some() {
+            return;
+        }
+        if active.is_none() {
+            self.active_facts = (None, vec![]);
+            return;
+        }
+        self.active_facts.0 = active.clone();
+        let bus = self.bus.clone();
+        let sid = active.unwrap();
+        cx.spawn(async move |this, cx| {
+            if let Ok(v) = bus.request("services", "fact.list", json!({ "session": sid })).await {
+                let facts: Vec<Fact> = serde_json::from_value(v).unwrap_or_default();
+                let _ = this.update(cx, |wb, cx| {
+                    if wb.active_facts.0.as_deref() == Some(sid.as_str()) {
+                        wb.active_facts.1 = facts;
+                        cx.notify();
+                    }
+                });
+            }
         })
         .detach();
     }
@@ -506,49 +595,169 @@ impl Workbench {
                     .hover(|s| s.bg(rgb(BTN_HOVER)))
                     .cursor_pointer()
                     .child(format!("+ {}", a.name))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.new_session(id.clone(), cx)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.new_session(id.clone(), None, vec![], cx)))
             }))
-            .child(section_header("SESSIONS"))
+            .child({
+                // Views and the plain session list share one scroll area.
+                let mut rows: Vec<gpui::AnyElement> = vec![];
+                for v in &self.views {
+                    let title = v.view.title.clone().unwrap_or_else(|| v.view.id.clone()).to_uppercase();
+                    rows.push(section_header(&title).into_any_element());
+                    if v.root.children.is_empty() {
+                        rows.push(div().px_3().text_xs().text_color(rgb(DIM)).child("no sessions").into_any_element());
+                    }
+                    self.tree_rows(v, &v.root, 0, active_sid.as_deref(), &mut rows, cx);
+                }
+                rows.push(section_header("ALL SESSIONS").into_any_element());
+                for s in &self.sessions {
+                    let selected = active_sid.as_deref() == Some(s.id.as_str());
+                    rows.push(self.session_row(format!("all-{}", s.id), s, 0, selected, cx));
+                }
+                div().id("left-scroll").flex_1().overflow_y_scroll().children(rows)
+            })
+    }
+
+    fn session_row(&self, key: String, s: &SessionInfo, depth: usize, selected: bool, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let id = s.id.clone();
+        let running = s.state == "running";
+        div()
+            .id(SharedString::from(key))
+            .pl(px(12.0 + 14.0 * depth as f32))
+            .pr_3()
+            .py_1()
+            .flex()
+            .flex_col()
+            .cursor_pointer()
+            .when(selected, |d| d.bg(rgb(BTN_HOVER)))
+            .hover(|d| d.bg(rgb(BTN)))
             .child(
                 div()
-                    .id("session-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .children(self.sessions.iter().enumerate().map(|(i, s)| {
-                        let id = s.id.clone();
-                        let running = s.state == "running";
-                        let selected = active_sid.as_deref() == Some(s.id.as_str());
+                    .flex()
+                    .flex_row()
+                    .gap_2()
+                    .items_center()
+                    .child(div().text_color(rgb(if running { 0x23d18b } else { 0x666666 })).child("●"))
+                    .child(
                         div()
-                            .id(("session", i))
-                            .px_3()
-                            .py_1()
-                            .flex()
-                            .flex_col()
-                            .cursor_pointer()
-                            .when(selected, |d| d.bg(rgb(BTN_HOVER)))
-                            .hover(|d| d.bg(rgb(BTN)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_row()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(div().text_color(rgb(if running { 0x23d18b } else { 0x666666 })).child("●"))
-                                    .child(
-                                        div()
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_color(rgb(if running { TEXT } else { DIM }))
-                                            .child(self.session_title(&s.id)),
-                                    ),
-                            )
-                            .child(div().w_full().truncate().text_xs().text_color(rgb(DIM)).child(s.cwd.clone()))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.open_tab(&id);
-                                cx.notify();
-                            }))
-                    })),
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(if running { TEXT } else { DIM }))
+                            .child(self.session_title(&s.id)),
+                    ),
             )
+            .child(div().w_full().truncate().text_xs().text_color(rgb(DIM)).child(s.cwd.clone()))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                this.open_tab(&id);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Flatten a tree view into rows: nodes (collapsible, with "+") and their sessions.
+    fn tree_rows(
+        &self,
+        view: &RenderedView,
+        node: &TreeNode,
+        depth: usize,
+        active_sid: Option<&str>,
+        rows: &mut Vec<gpui::AnyElement>,
+        cx: &mut Context<Self>,
+    ) {
+        for child in &node.children {
+            let path: Vec<String> = child.facts.iter().map(|f| format!("{}={}", f.key, f.value)).collect();
+            let nkey = format!("{}|{}", view.view.id, path.join("/"));
+            let collapsed = self.collapsed.contains(&nkey);
+            let can_create = view.view.create && !child.key.is_empty();
+            let toggle_key = nkey.clone();
+            let plus_key = nkey.clone();
+            rows.push(
+                div()
+                    .id(SharedString::from(format!("node-{nkey}")))
+                    .pl(px(8.0 + 14.0 * depth as f32))
+                    .pr_2()
+                    .py(px(3.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(BTN)))
+                    .child(div().w(px(12.0)).text_xs().text_color(rgb(DIM)).child(if collapsed { "▸" } else { "▾" }))
+                    .child(div().flex_none().text_xs().text_color(rgb(DIM)).child(child.key.clone()))
+                    .child(div().flex_1().min_w_0().truncate().child(child.value.clone()))
+                    .child(div().flex_none().text_xs().text_color(rgb(DIM)).child(child.count.to_string()))
+                    .when(can_create, |d| {
+                        d.child(
+                            div()
+                                .id(SharedString::from(format!("plus-{nkey}")))
+                                .flex_none()
+                                .px_1()
+                                .rounded_sm()
+                                .text_color(rgb(DIM))
+                                .hover(|s| s.bg(rgb(BTN_HOVER)).text_color(rgb(TEXT)))
+                                .child("+")
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.create_at = if this.create_at.as_deref() == Some(plus_key.as_str()) {
+                                        None
+                                    } else {
+                                        Some(plus_key.clone())
+                                    };
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if !this.collapsed.remove(&toggle_key) {
+                            this.collapsed.insert(toggle_key.clone());
+                        }
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+            if self.create_at.as_deref() == Some(nkey.as_str()) {
+                let mut picker = div()
+                    .pl(px(22.0 + 14.0 * depth as f32))
+                    .pr_2()
+                    .py_1()
+                    .flex()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(div().text_xs().text_color(rgb(DIM)).child("new:"));
+                for (i, a) in self.agents.iter().enumerate() {
+                    let agent = a.id.clone();
+                    let cwd = child.cwd.clone();
+                    let facts = child.facts.clone();
+                    picker = picker.child(
+                        div()
+                            .id(SharedString::from(format!("pick-{nkey}-{i}")))
+                            .px_2()
+                            .rounded_sm()
+                            .text_xs()
+                            .bg(rgb(BTN))
+                            .hover(|s| s.bg(rgb(BTN_HOVER)))
+                            .cursor_pointer()
+                            .child(a.name.clone())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.create_at = None;
+                                this.new_session(agent.clone(), cwd.clone(), facts.clone(), cx);
+                                cx.notify();
+                            })),
+                    );
+                }
+                rows.push(picker.into_any_element());
+            }
+            if !collapsed {
+                self.tree_rows(view, child, depth + 1, active_sid, rows, cx);
+                for sid in &child.sessions {
+                    if let Some(s) = self.session(sid) {
+                        let selected = active_sid == Some(sid.as_str());
+                        rows.push(self.session_row(format!("tree-{nkey}-{sid}"), s, depth + 1, selected, cx));
+                    }
+                }
+            }
+        }
     }
 
     fn render_right(&self) -> impl IntoElement {
@@ -575,7 +784,7 @@ impl Workbench {
                     .child(row("State", s.state.clone()))
                     .child(row("Session", s.id.clone()))
                     .child(section_header("FACTS"))
-                    .child(div().px_3().text_color(rgb(DIM)).child("none yet (M1)"))
+                    .child(self.render_facts(&s.id))
                     .child(section_header("DOCUMENTS"))
                     .child(div().px_3().text_color(rgb(DIM)).child("none yet (M2)"));
             }
@@ -592,6 +801,36 @@ impl Workbench {
             .border_color(rgb(BORDER))
             .child(section_header("CONTEXT"))
             .child(body)
+    }
+
+    fn render_facts(&self, sid: &str) -> gpui::AnyElement {
+        let facts: &[Fact] = if self.active_facts.0.as_deref() == Some(sid) { &self.active_facts.1 } else { &[] };
+        if facts.is_empty() {
+            return div().px_3().text_color(rgb(DIM)).child("none").into_any_element();
+        }
+        div()
+            .flex()
+            .flex_col()
+            .children(facts.iter().map(|f| {
+                div()
+                    .px_3()
+                    .py(px(2.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(div().flex_none().text_color(rgb(DIM)).child(f.key.clone()))
+                            .child(div().flex_1().min_w_0().truncate().child(f.value.clone())),
+                    )
+                    .child(div().text_xs().text_color(rgb(0x666666)).child(match &f.kind {
+                        Some(k) => format!("{} · {k}", f.source),
+                        None => f.source.clone(),
+                    }))
+            }))
+            .into_any_element()
     }
 
     fn render_pane(&self, pi: usize, cx: &mut Context<Self>) -> impl IntoElement {
@@ -770,6 +1009,7 @@ fn render_line(line: &[Run], cell_w: f32, line_h: f32) -> impl IntoElement {
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_sizes(window);
+        self.sync_active_facts(cx);
         if self.want_focus {
             self.want_focus = false;
             if let Some(p) = self.panes.get(self.active_pane) {

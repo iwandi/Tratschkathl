@@ -578,6 +578,8 @@ docs/
 3. **Gated tools**: which tools need user approval by default once sessions develop the app on their own?
    Is `ui_command_set` gated? It changes what the user sees.
 4. **Fact trust**: should agent-announced facts and plugin-derived facts be weighted differently when they conflict?
+   *M1 rule:* a derived fact never overrides a fact that an agent or the user set for the same key. A plugin only
+   replaces or clears its own facts. Is that enough, or do we need explicit weights?
 5. **Plugin v2 timing**: out-of-process JSON-RPC, or the WASM component model?
 6. **Visualization**: which candidate in §7.4 should be prototyped first?
 7. **Bus serialization**: JSON, which is easy to debug, or a binary format (postcard), which suits terminal grid diffs?

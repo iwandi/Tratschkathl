@@ -1,0 +1,10 @@
+[package]
+name = "tk-plugin-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tk-plugin-api.workspace = true
+tk-bus.workspace = true

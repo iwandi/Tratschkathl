@@ -5760,6 +5760,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tk-plugin-api"
+version = "0.1.0"
+dependencies = [
+ "tk-bus",
+]
+
+[[package]]
+name = "tk-plugin-git"
+version = "0.1.0"
+dependencies = [
+ "tk-bus",
+ "tk-plugin-api",
+]
+
+[[package]]
 name = "tk-services"
 version = "0.1.0"
 dependencies = [
@@ -5768,7 +5783,10 @@ dependencies = [
  "serde",
  "serde_json",
  "tk-bus",
+ "tk-plugin-api",
+ "tk-plugin-git",
  "tokio",
+ "toml 0.8.23",
  "tracing",
 ]
 
